@@ -3,6 +3,7 @@ name = "vllm-expert-pager"
 version = "0.1.0"
 description = "vLLM plugin that pages MoE expert weights between VRAM, pinned RAM, and SSD"
 readme = "README.md"
+license = "MIT"
 authors = [
     { name = "monochromegane" }
 ]
