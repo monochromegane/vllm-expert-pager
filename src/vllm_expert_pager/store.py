@@ -30,6 +30,11 @@ logger = init_logger(f"vllm.{__name__}")
 # Alignment required by O_DIRECT. Rows, records and the pinned base address
 # must be multiples of this.
 _ALIGN = 4096
+# torch's pinned allocator (CachingHostAllocator) rounds allocation sizes up to
+# the next power of two. The RAM tier takes tens of GiB per name in a single
+# allocation, so a 20.5 GiB request would consume 32 GiB. Change the allocator
+# setting so pinned allocations of this size or more are not rounded.
+_PINNED_ROUND_LIMIT_MB = 1024
 
 
 def _pinned_aligned(rows: int, words: int) -> torch.Tensor:
@@ -90,6 +95,15 @@ class Store:
         # Rows [0, L*R) are the RAM tier (slot s of layer l is l*R + s); rows
         # [L*R, L*R+E) are the shared working rows.
         self.working_base = L * R
+        torch._C._accelerator_setAllocatorSettings(
+            f"pinned_max_round_threshold_mb:{_PINNED_ROUND_LIMIT_MB}"
+        )
+        logger.info(
+            "vllm-expert-pager: RAM tier %d rows x %d B = %.2f GiB pinned",
+            L * R + E,
+            self.record_bytes,
+            (L * R + E) * self.record_bytes / 2**30,
+        )
         self.pinned = {
             name: _pinned_aligned(L * R + E, nbytes // 4)
             for name, nbytes in row_bytes.items()

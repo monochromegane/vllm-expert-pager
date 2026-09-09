@@ -89,6 +89,17 @@ def test_fetch_reads_missing_experts_in_graph(store):
     assert int(store.req[0]) == seq_before
 
 
+def test_large_pinned_is_not_rounded_to_pow2(store):
+    # Store turns off the allocator's power-of-two rounding for large
+    # allocations (store.py). 1.5 GiB would become 2 GiB if rounded.
+    n = 3 * 2**29
+    key = "allocated_bytes.current"
+    before = torch.cuda.host_memory_stats()[key]
+    t = torch.empty((n,), dtype=torch.uint8, device="cpu", pin_memory=True)
+    assert torch.cuda.host_memory_stats()[key] - before == n
+    del t
+
+
 def test_rejects_foreign_file(tmp_path):
     path = tmp_path / "expert_pager.bin"
     path.write_bytes(b"not a paging file")

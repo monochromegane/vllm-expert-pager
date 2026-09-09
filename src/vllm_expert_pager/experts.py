@@ -45,7 +45,8 @@ SSD_PATH = os.environ.get("VLLM_EXPERT_PAGER_SSD_PATH")
 # on the device and include replays.
 LOG_INTERVAL = int(os.environ.get("VLLM_EXPERT_PAGER_LOG_INTERVAL", "1000"))
 
-# Expert weights referenced through the slab. Scales stay resident in VRAM.
+# Expert weights referenced through the slab. Scales stay resident in VRAM and
+# are shown reordered by slot.
 PARAMS = ("w13_weight", "w2_weight")
 
 _store: Store | None = None
@@ -261,7 +262,28 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         # The expert_map read by the kernel. int32 at a fixed address, updated
         # with copy_ every step.
         self._expert_pager_map = torch.empty((E,), dtype=torch.int32, device=device)
-        self._expert_pager_params = params
+
+        # Scales stay in VRAM as (E, ...). The kernel indexes scales with the
+        # same slot number as the weights (off_experts in fused_moe_kernel), so
+        # show it a copy reordered by slot every step. The trailing row is the
+        # sink for experts that are not needed (as in table.py).
+        scale_name = getattr(self.quant_method, "weight_scale_name", None)
+        if scale_name is None:
+            raise RuntimeError(
+                f"{self.layer_name}: {type(self.quant_method).__name__} has no "
+                "weight_scale_name; vllm-expert-pager only knows how to stage FP8 "
+                "scales"
+            )
+        scales = {
+            f"{w}_{scale_name}": getattr(self, f"{w}_{scale_name}")
+            for w in ("w13", "w2")
+        }
+        self._expert_pager_scale_full = {name: p.data for name, p in scales.items()}
+        self._expert_pager_scale_slab = {
+            name: torch.empty((E + 1, *p.shape[1:]), dtype=p.dtype, device=device)
+            for name, p in scales.items()
+        }
+        self._expert_pager_params = {**params, **scales}
 
         logger.info_once(
             "vllm-expert-pager: %d cache slots/layer, %d RAM slots/layer, %s",
@@ -319,6 +341,15 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             ssd_todo = torch.where(in_ram[need.clamp(min=0)] >= 0, -1, need)
             base = 0
         fetch_rows(ssd_todo, src_row, base, layer, store)
+        if store.path is not None and not torch.cuda.is_current_stream_capturing():
+            # In eager mode Python keeps queuing kernels for later layers, and
+            # once the launch queue is full that launch blocks while holding the
+            # GIL (Triton's launcher does not release it). The GPU is waiting in
+            # fetch for the host's done, and the host thread is waiting for the
+            # GIL: a deadlock (reproduced on WSL2). Wait for the fetch to finish
+            # with the GIL released. Graph replay does not run Python per layer,
+            # so it needs none of this.
+            torch.cuda.current_stream().synchronize()
 
         for name in slabs:
             gather_rows(
@@ -332,13 +363,21 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 dst_rows[name],
             )
         self._expert_pager_map.copy_(expert_map)
+        sink = torch.where(expert_map >= 0, expert_map, self.global_num_experts)
+        for name, full in self._expert_pager_scale_full.items():
+            self._expert_pager_scale_slab[name].index_put_((sink,), full)
 
         self._expert_pager_log()
 
+        rows = slabs["w13_weight"].shape[0]
+        staged = {
+            **slabs,
+            **{n: t[:rows] for n, t in self._expert_pager_scale_slab.items()},
+        }
         saved = {name: param.data for name, param in self._expert_pager_params.items()}
         try:
             for name, param in self._expert_pager_params.items():
-                param.data = slabs[name]
+                param.data = staged[name]
             self._expert_pager_expert_map = self._expert_pager_map
             return super().forward_modular(
                 x=x,
