@@ -1,21 +1,28 @@
 """Hook ``RoutedExperts`` so that expert weights are referenced through a slab.
 
-Only the experts needed in the current step are copied into the slab, and
-``expert_map`` renumbers experts to slots before the kernel runs. Evicting the
-weights to the CPU side is left to vLLM's standard
-``--cpu-offload-params w13_weight w2_weight``.
+Expert weights live in three tiers: the VRAM slab, pinned RAM, and a paging
+file on SSD. The plugin owns their placement from load time on and does not
+use vLLM's CPU offload.
 
-Every per-step decision (which experts are needed, which slot each goes to,
-what to evict) is made on device tensors and the host never reads a value.
-This is what lets the layer run under CUDA graphs.
+- Construction: the (E, ...) weights allocated by create_weights are replaced
+  with one-row placeholders
+- Loading: weight_loader is intercepted and each expert's weights are written
+  to the paging file and to the RAM tier (experts numbered below R)
+- Inference: only the experts needed in the step are copied into the slab, and
+  expert_map renumbers experts to slots before the kernel runs. Decisions are
+  made on device tensors and the host never reads a value. For experts not in
+  RAM the GPU asks a host thread to read them from SSD
 """
 
 import os
 
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
+from vllm_expert_pager.store import Store
 from vllm_expert_pager.table import ExpertTable
 
 # vLLM only configures handlers and levels for the "vllm" logger
@@ -27,27 +34,24 @@ logger = init_logger(f"vllm.{__name__}")
 # Number of cache slots per layer. One slot holds one expert (about 3 MiB for
 # 35B-A3B).
 CACHE_SLOTS = int(os.environ.get("VLLM_EXPERT_PAGER_CACHE_SLOTS", "32"))
+# Number of RAM-tier slots per layer. Unset means every expert (RAM only; the
+# SSD is never read).
+RAM_SLOTS = os.environ.get("VLLM_EXPERT_PAGER_RAM_SLOTS")
+# Paging file. Required when RAM_SLOTS is smaller than the number of experts.
+SSD_PATH = os.environ.get("VLLM_EXPERT_PAGER_SSD_PATH")
 # Interval for logging the hit rate, in Python calls of forward per layer. 0
 # disables it. CUDA graph replay does not run Python, so the log only appears
 # when forward is called eagerly (prefill etc.). The counters themselves live
 # on the device and include replays.
 LOG_INTERVAL = int(os.environ.get("VLLM_EXPERT_PAGER_LOG_INTERVAL", "1000"))
 
-# Parameters that have an expert axis but are not expert weights. The same set
-# that RoutedExperts.get_expert_weights() excludes from EPLB.
-_NON_EXPERT_PARAMS = frozenset(
-    {
-        "e_score_correction_bias",
-        "w13_input_scale",
-        "w2_input_scale",
-        "hash_indices_table",
-    }
-)
+# Expert weights referenced through the slab. Scales stay resident in VRAM.
+PARAMS = ("w13_weight", "w2_weight")
 
-# Working buffers shared across all layers. Layers with identical shapes reuse
-# one buffer. Layers run sequentially on the same stream, so there is no
-# cross-layer race.
-_working_slabs: dict[tuple, dict[str, torch.Tensor]] = {}
+_store: Store | None = None
+# Working buffer shared across all layers. Layers run sequentially on the same
+# stream, so there is no cross-layer race.
+_working_slab: dict[str, torch.Tensor] | None = None
 
 
 class ExpertPagerRoutedExperts(RoutedExperts):
@@ -59,9 +63,70 @@ class ExpertPagerRoutedExperts(RoutedExperts):
     not work under CUDA graphs.
     """
 
-    _expert_pager_params: dict[str, torch.nn.Parameter] | None = None
     _expert_pager_expert_map: torch.Tensor | None = None
     _expert_pager_calls = 0
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self.use_ep or self.local_num_experts != self.global_num_experts:
+            raise RuntimeError(
+                f"{self.layer_name}: vllm-expert-pager does not support expert "
+                f"parallelism (local={self.local_num_experts}, "
+                f"global={self.global_num_experts})"
+            )
+        if self.moe_config.moe_parallel_config.tp_size != 1:
+            raise RuntimeError(
+                f"{self.layer_name}: vllm-expert-pager does not support tensor "
+                "parallelism"
+            )
+        E = self.global_num_experts
+        params = {name: getattr(self, name) for name in PARAMS}
+
+        global _store
+        if _store is None:
+            R = int(RAM_SLOTS) if RAM_SLOTS else E
+            if R < CACHE_SLOTS:
+                raise ValueError(
+                    f"VLLM_EXPERT_PAGER_RAM_SLOTS={R} must be >= "
+                    f"VLLM_EXPERT_PAGER_CACHE_SLOTS={CACHE_SLOTS}"
+                )
+            _store = Store(
+                num_layers=get_current_vllm_config().model_config.hf_text_config.num_hidden_layers,
+                num_experts=E,
+                ram_slots=R,
+                row_bytes={
+                    n: p[0].numel() * p.element_size() for n, p in params.items()
+                },
+                path=SSD_PATH,
+                device=params["w13_weight"].device,
+            )
+        self._expert_pager_store = _store
+        self._expert_pager_layer = _store.add_layer()
+
+        # Free the (E, ...) allocated by create_weights and keep only the shape.
+        # Marlin's process_weights_after_loading repacks every expert, so
+        # present E rows through a stride-0 expand. _expert_pager_setup shrinks
+        # it back to one row afterwards.
+        for p in params.values():
+            p.data = torch.empty(
+                (1, *p.shape[1:]), dtype=p.dtype, device=p.device
+            ).expand(p.shape)
+        self._expert_pager_marlin = (
+            getattr(self.quant_method, "fp8_backend", None) == Fp8MoeBackend.MARLIN
+        )
+        # w13 arrives as separate gate and up shards, so stage per expert until
+        # both are in.
+        self._expert_pager_stage: dict[int, tuple[torch.Tensor, set[str]]] = {}
+
+        # quant_method is a per-layer instance. Set up the slab right after the
+        # post-load processing.
+        original = self.quant_method.process_weights_after_loading
+
+        def process_weights_after_loading(layer: RoutedExperts) -> None:
+            original(layer)
+            layer._expert_pager_setup()
+
+        self.quant_method.process_weights_after_loading = process_weights_after_loading
 
     # ---- expert_map override ----
 
@@ -71,113 +136,139 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             return self._expert_pager_expert_map
         return super().expert_map
 
-    # ---- Setup (on the first forward) ----
+    # ---- Loading ----
 
-    def _expert_pager_setup(self, device: torch.device) -> None:
+    def weight_loader(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        return_success: bool = False,
+    ) -> bool | None:
+        if param is self.w13_weight:
+            N, H = self.intermediate_size_per_partition, self.hidden_size
+            buf, seen = self._expert_pager_stage.setdefault(
+                expert_id,
+                (
+                    torch.empty((2 * N, H), dtype=loaded_weight.dtype, device="cpu"),
+                    set(),
+                ),
+            )
+            # w1 (gate) goes in the first half, w3 (up) in the second. Same as
+            # RoutedExperts._load_w13.
+            half = 0 if shard_id == "w1" else N
+            buf[half : half + N].copy_(loaded_weight)
+            seen.add(shard_id)
+            if seen != {"w1", "w3"}:
+                return True if return_success else None
+            del self._expert_pager_stage[expert_id]
+            self._expert_pager_store.write(
+                self._expert_pager_layer,
+                expert_id,
+                "w13_weight",
+                self._expert_pager_pack(buf),
+            )
+        elif param is self.w2_weight:
+            self._expert_pager_store.write(
+                self._expert_pager_layer,
+                expert_id,
+                "w2_weight",
+                self._expert_pager_pack(loaded_weight),
+            )
+        else:
+            return super().weight_loader(
+                param, loaded_weight, weight_name, shard_id, expert_id, return_success
+            )
+        return True if return_success else None
+
+    def _expert_pager_pack(self, w: torch.Tensor) -> torch.Tensor:
+        """Turn one expert's (n, k) into the form the kernel reads.
+
+        As-is for Triton, repacked for Marlin.
+        """
+        if not self._expert_pager_marlin:
+            return w
+        from vllm import _custom_ops as ops
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+            pack_fp8_to_int32,
+        )
+
+        # repack_weight from prepare_fp8_moe_layer_for_marlin applied to a
+        # single expert.
+        q = pack_fp8_to_int32(w.cuda(), size_k_first=False).T.contiguous()
+        perm = torch.empty(0, dtype=torch.int, device=q.device)
+        return ops.gptq_marlin_repack(
+            b_q_weight=q, perm=perm, size_k=w.shape[1], size_n=w.shape[0], num_bits=8
+        ).cpu()
+
+    # ---- After loading ----
+
+    def _expert_pager_setup(self) -> None:
         # triton only exists in GPU environments, so import it here.
         from vllm_expert_pager.gather import as_rows
 
-        if self.use_ep or self.local_num_experts != self.global_num_experts:
-            raise RuntimeError(
-                f"{self.layer_name}: vllm-expert-pager does not support expert "
-                f"parallelism (local={self.local_num_experts}, "
-                f"global={self.global_num_experts})"
-            )
-
-        params = {
-            name: param
-            for name, param in self.named_parameters()
-            if param.dim() >= 2
-            and param.shape[0] == self.local_num_experts
-            and name not in _NON_EXPERT_PARAMS
-        }
-        missing = {"w13_weight", "w2_weight"} - params.keys()
-        if missing:
-            raise RuntimeError(
-                f"{self.layer_name}: per-expert parameters {sorted(missing)} not found; "
-                f"got {sorted(params)}"
-            )
-
-        # p.data is swapped for the slab later, so keep the original tensors as
-        # the copy source.
-        self._expert_pager_src = {name: param.data for name, param in params.items()}
-        self._expert_pager_table = ExpertTable(
-            self.global_num_experts, CACHE_SLOTS, device
-        )
-        self._expert_pager_cache_slab = {
-            name: torch.empty(
-                (CACHE_SLOTS, *param.shape[1:]), dtype=param.dtype, device=device
-            )
-            for name, param in params.items()
-        }
-
-        signature = tuple(
-            (name, tuple(param.shape[1:]), param.dtype, str(device))
-            for name, param in sorted(params.items())
-        ) + (self.local_num_experts,)
-        slab = _working_slabs.get(signature)
-        if slab is None:
-            slab = {
-                name: torch.empty(
-                    (self.local_num_experts, *param.shape[1:]),
-                    dtype=param.dtype,
-                    device=device,
+        store = self._expert_pager_store
+        params = {name: getattr(self, name) for name in PARAMS}
+        for name, p in params.items():
+            # Shrink the (E, ...) repacked by Marlin back to one row; for Triton
+            # this undoes the expand. The leading slice is contiguous, so
+            # contiguous() would not copy and the original (E, ...) would stay
+            # alive.
+            p.data = p.data[:1].clone()
+            if as_rows(p.data).shape[1] != store.pinned[name].shape[1]:
+                raise RuntimeError(
+                    f"{self.layer_name}: {name} row has {as_rows(p.data).shape[1]} words "
+                    f"after process_weights_after_loading, RAM rows have "
+                    f"{store.pinned[name].shape[1]}"
                 )
-                for name, param in params.items()
-            }
-            _working_slabs[signature] = slab
-        self._expert_pager_working_slab = slab
+        device = params["w13_weight"].device
+        E = self.global_num_experts
 
-        # (E, W) / (S, W) int32 views handed to the gather kernel.
-        self._expert_pager_src_rows = {
-            n: as_rows(t) for n, t in self._expert_pager_src.items()
+        self._expert_pager_table = ExpertTable(E, CACHE_SLOTS, device)
+        self._expert_pager_ram = ExpertTable(E, store.ram_slots, device)
+        # Warm start: at load time expert e < R was placed in RAM-tier slot e.
+        R = store.ram_slots
+        self._expert_pager_ram.slot_of[:R] = self._expert_pager_ram.experts[:R]
+        self._expert_pager_ram.expert_in[:R] = self._expert_pager_ram.experts[:R]
+
+        self._expert_pager_cache_slab = {
+            name: torch.empty((CACHE_SLOTS, *p.shape[1:]), dtype=p.dtype, device=device)
+            for name, p in params.items()
         }
+        global _working_slab
+        if _working_slab is None:
+            _working_slab = {
+                name: torch.empty((E, *p.shape[1:]), dtype=p.dtype, device=device)
+                for name, p in params.items()
+            }
+        for name, p in params.items():
+            if _working_slab[name].shape[1:] != p.shape[1:]:
+                raise RuntimeError(
+                    f"{self.layer_name}: {name} shape differs from other layers"
+                )
+        self._expert_pager_working_slab = _working_slab
+
+        # (S, W) / (E, W) int32 views handed to the gather kernel.
         self._expert_pager_cache_rows = {
             n: as_rows(t) for n, t in self._expert_pager_cache_slab.items()
         }
-        self._expert_pager_working_rows = {n: as_rows(t) for n, t in slab.items()}
+        self._expert_pager_working_rows = {
+            n: as_rows(t) for n, t in _working_slab.items()
+        }
 
         # The expert_map read by the kernel. int32 at a fixed address, updated
         # with copy_ every step.
-        self._expert_pager_map = torch.empty(
-            (self.global_num_experts,), dtype=torch.int32, device=device
-        )
-
-        # Weights offloaded through UVA live in pinned host memory, but they are
-        # referenced through a device-visible view, so `.device` reports cuda.
-        # They cannot be told apart from VRAM-resident weights. vLLM sets
-        # `_vllm_is_uva_offloaded` on the Parameter (offloader/uva.py), but
-        # quantization backends that re-register parameters in
-        # process_weights_after_loading (Marlin) drop this attribute. So a
-        # missing marker does not mean "resident".
-        on_cpu = sorted(
-            name for name, src in self._expert_pager_src.items() if src.device != device
-        )
-        uva = sorted(
-            name
-            for name, param in params.items()
-            if name not in on_cpu and getattr(param, "_vllm_is_uva_offloaded", False)
-        )
-        unknown = sorted(params.keys() - set(on_cpu) - set(uva))
-
-        if on_cpu:
-            raise RuntimeError(
-                f"{self.layer_name}: expert weights {', '.join(on_cpu)} are plain CPU "
-                "tensors rather than a UVA view; the gather kernel needs a device "
-                "pointer. Check that VLLM_WEIGHT_OFFLOADING_DISABLE_UVA is unset and "
-                "UVA is available."
-            )
-        # The *_once variants memoize with lru_cache, so the arguments must be
-        # hashable.
-        logger.info_once(
-            "vllm-expert-pager: %d slots/layer, slabbed params %s "
-            "(uva: %s / vram or uva-without-marker: %s)",
-            CACHE_SLOTS,
-            ", ".join(sorted(params)),
-            ", ".join(uva) or "none",
-            ", ".join(unknown) or "none",
-        )
+        self._expert_pager_map = torch.empty((E,), dtype=torch.int32, device=device)
         self._expert_pager_params = params
+
+        logger.info_once(
+            "vllm-expert-pager: %d cache slots/layer, %d RAM slots/layer, %s",
+            CACHE_SLOTS,
+            R,
+            "marlin repack" if self._expert_pager_marlin else "raw rows",
+        )
 
     # ---- forward ----
 
@@ -189,33 +280,54 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         shared_experts=None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from vllm_expert_pager.gather import gather_rows
+        from vllm_expert_pager.gather import fetch_rows, gather_rows
 
-        if self._expert_pager_params is None:
-            self._expert_pager_setup(x.device)
-        table = self._expert_pager_table
+        store = self._expert_pager_store
+        if store.failed is not None:
+            raise RuntimeError(f"vllm-expert-pager: SSD read failed\n{store.failed}")
+        vram, ram = self._expert_pager_table, self._expert_pager_ram
+        K = topk_ids.numel()
+        R, layer = store.ram_slots, self._expert_pager_layer
 
         # Choose the path from the shape alone, so capture and replay of the
         # graph take the same path.
-        if topk_ids.numel() <= table.num_slots:
+        if K <= vram.num_slots:
             slabs = self._expert_pager_cache_slab
             dst_rows = self._expert_pager_cache_rows
-            expert_map, dst_row, todo = table.acquire(topk_ids)
-            cached_row = table.no_cache  # read everything from UVA
+            expert_map, dst_row, todo = vram.acquire(topk_ids)
+            cached_row = vram.no_cache  # read everything from the RAM tier
         else:
             # May not fit in the slots, so use the working buffer without
             # updating the table. Experts that hit are copied from the cache
             # slab within VRAM.
             slabs = self._expert_pager_working_slab
             dst_rows = self._expert_pager_working_rows
-            expert_map, dst_row, cached_row, todo = table.lookup(topk_ids)
+            expert_map, dst_row, cached_row, todo = vram.lookup(topk_ids)
+
+        # The RAM tier follows the same rule. It is touched every step, so RAM
+        # stays a superset of VRAM.
+        if K <= R:
+            _, src_row, ssd_todo = ram.acquire(topk_ids)
+            base = layer * R
+        else:
+            # Does not fit in the RAM tier (prefill). Misses are read into the
+            # shared working rows.
+            _, packed, in_ram, need = ram.lookup(topk_ids)
+            src_row = torch.where(
+                in_ram >= 0, in_ram + layer * R, packed + store.working_base
+            )
+            ssd_todo = torch.where(in_ram[need.clamp(min=0)] >= 0, -1, need)
+            base = 0
+        fetch_rows(ssd_todo, src_row, base, layer, store)
 
         for name in slabs:
             gather_rows(
                 todo,
                 dst_row,
                 cached_row,
-                self._expert_pager_src_rows[name],
+                src_row,
+                base,
+                store.view[name],
                 self._expert_pager_cache_rows[name],
                 dst_rows[name],
             )
@@ -255,15 +367,19 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         # during capture.
         if torch.cuda.is_current_stream_capturing():
             return
-        table = self._expert_pager_table
-        hits, misses = torch.stack([table.hits, table.misses]).tolist()
-        total = hits + misses
+        vram, ram = self._expert_pager_table, self._expert_pager_ram
+        vh, vm, rh, rm = torch.stack(
+            [vram.hits, vram.misses, ram.hits, ram.misses]
+        ).tolist()
         logger.info(
-            "vllm-expert-pager %s: hit %.1f%% (%d/%d)",
+            "vllm-expert-pager %s: vram hit %.1f%% (%d/%d), ram hit %.1f%% (%d/%d)",
             self.layer_name,
-            100.0 * hits / total if total else 0.0,
-            hits,
-            total,
+            100.0 * vh / (vh + vm) if vh + vm else 0.0,
+            vh,
+            vh + vm,
+            100.0 * rh / (rh + rm) if rh + rm else 0.0,
+            rh,
+            rh + rm,
         )
 
 
