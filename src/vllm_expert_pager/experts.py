@@ -4,6 +4,10 @@ Only the experts needed in the current step are copied into the slab, and
 ``expert_map`` renumbers experts to slots before the kernel runs. Evicting the
 weights to the CPU side is left to vLLM's standard
 ``--cpu-offload-params w13_weight w2_weight``.
+
+Every per-step decision (which experts are needed, which slot each goes to,
+what to evict) is made on device tensors and the host never reads a value.
+This is what lets the layer run under CUDA graphs.
 """
 
 import os
@@ -12,7 +16,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-from vllm_expert_pager.cache import ExpertCache
+from vllm_expert_pager.table import ExpertTable
 
 # vLLM only configures handlers and levels for the "vllm" logger
 # (DEFAULT_LOGGING_CONFIG in logger.py), so take a name under it. A bare
@@ -23,7 +27,10 @@ logger = init_logger(f"vllm.{__name__}")
 # Number of cache slots per layer. One slot holds one expert (about 3 MiB for
 # 35B-A3B).
 CACHE_SLOTS = int(os.environ.get("VLLM_EXPERT_PAGER_CACHE_SLOTS", "32"))
-# Interval for logging the hit rate, in forward calls per layer. 0 disables it.
+# Interval for logging the hit rate, in Python calls of forward per layer. 0
+# disables it. CUDA graph replay does not run Python, so the log only appears
+# when forward is called eagerly (prefill etc.). The counters themselves live
+# on the device and include replays.
 LOG_INTERVAL = int(os.environ.get("VLLM_EXPERT_PAGER_LOG_INTERVAL", "1000"))
 
 # Parameters that have an expert axis but are not expert weights. The same set
@@ -46,8 +53,10 @@ _working_slabs: dict[tuple, dict[str, torch.Tensor]] = {}
 class ExpertPagerRoutedExperts(RoutedExperts):
     """``RoutedExperts`` that references expert weights through a slab.
 
-    Uses the cache slab when the number of experts needed fits in the slots,
-    and the working buffer otherwise.
+    Uses the cache slab when ``topk_ids`` has no more elements than there are
+    slots, and the working buffer otherwise. The decision is made on the shape
+    alone: checking ``|U|`` would require the host to read a value, which does
+    not work under CUDA graphs.
     """
 
     _expert_pager_params: dict[str, torch.nn.Parameter] | None = None
@@ -65,6 +74,9 @@ class ExpertPagerRoutedExperts(RoutedExperts):
     # ---- Setup (on the first forward) ----
 
     def _expert_pager_setup(self, device: torch.device) -> None:
+        # triton only exists in GPU environments, so import it here.
+        from vllm_expert_pager.gather import as_rows
+
         if self.use_ep or self.local_num_experts != self.global_num_experts:
             raise RuntimeError(
                 f"{self.layer_name}: vllm-expert-pager does not support expert "
@@ -89,7 +101,9 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         # p.data is swapped for the slab later, so keep the original tensors as
         # the copy source.
         self._expert_pager_src = {name: param.data for name, param in params.items()}
-        self._expert_pager_cache = ExpertCache(CACHE_SLOTS)
+        self._expert_pager_table = ExpertTable(
+            self.global_num_experts, CACHE_SLOTS, device
+        )
         self._expert_pager_cache_slab = {
             name: torch.empty(
                 (CACHE_SLOTS, *param.shape[1:]), dtype=param.dtype, device=device
@@ -114,9 +128,17 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             _working_slabs[signature] = slab
         self._expert_pager_working_slab = slab
 
-        self._expert_pager_map_host = torch.full(
-            (self.global_num_experts,), -1, dtype=torch.int32
-        )
+        # (E, W) / (S, W) int32 views handed to the gather kernel.
+        self._expert_pager_src_rows = {
+            n: as_rows(t) for n, t in self._expert_pager_src.items()
+        }
+        self._expert_pager_cache_rows = {
+            n: as_rows(t) for n, t in self._expert_pager_cache_slab.items()
+        }
+        self._expert_pager_working_rows = {n: as_rows(t) for n, t in slab.items()}
+
+        # The expert_map read by the kernel. int32 at a fixed address, updated
+        # with copy_ every step.
         self._expert_pager_map = torch.empty(
             (self.global_num_experts,), dtype=torch.int32, device=device
         )
@@ -139,43 +161,23 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         unknown = sorted(params.keys() - set(on_cpu) - set(uva))
 
         if on_cpu:
-            logger.warning_once(
-                "vllm-expert-pager: expert weights %s are on plain CPU tensors rather "
-                "than a UVA view. vLLM also patches the decoder layer forward in this "
-                "case, which moves the whole layer to GPU every step. Check that "
-                "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA is unset and UVA is available.",
-                ", ".join(on_cpu),
+            raise RuntimeError(
+                f"{self.layer_name}: expert weights {', '.join(on_cpu)} are plain CPU "
+                "tensors rather than a UVA view; the gather kernel needs a device "
+                "pointer. Check that VLLM_WEIGHT_OFFLOADING_DISABLE_UVA is unset and "
+                "UVA is available."
             )
         # The *_once variants memoize with lru_cache, so the arguments must be
         # hashable.
         logger.info_once(
             "vllm-expert-pager: %d slots/layer, slabbed params %s "
-            "(on cpu: %s / uva: %s / vram or uva-without-marker: %s)",
+            "(uva: %s / vram or uva-without-marker: %s)",
             CACHE_SLOTS,
             ", ".join(sorted(params)),
-            ", ".join(on_cpu) or "none",
             ", ".join(uva) or "none",
             ", ".join(unknown) or "none",
         )
         self._expert_pager_params = params
-
-    # ---- Transfers ----
-
-    def _expert_pager_load(
-        self, dst: dict[str, torch.Tensor], slot: int, expert: int
-    ) -> None:
-        """Copy one expert from the source (CPU or UVA view) into the slab."""
-        for name, slab in dst.items():
-            slab[slot].copy_(self._expert_pager_src[name][expert], non_blocking=True)
-
-    def _expert_pager_reuse(
-        self, dst: dict[str, torch.Tensor], slot: int, cached_slot: int
-    ) -> None:
-        """Copy from the cache slab into the working buffer (cheap: stays in VRAM)."""
-        for name, slab in dst.items():
-            slab[slot].copy_(
-                self._expert_pager_cache_slab[name][cached_slot], non_blocking=True
-            )
 
     # ---- forward ----
 
@@ -187,42 +189,39 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         shared_experts=None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm_expert_pager.gather import gather_rows
+
         if self._expert_pager_params is None:
             self._expert_pager_setup(x.device)
+        table = self._expert_pager_table
 
-        # This forces a device -> host sync, which is why this cannot run under
-        # CUDA graphs.
-        experts = [
-            e
-            for e in torch.unique(topk_ids).tolist()
-            if 0 <= e < self.global_num_experts
-        ]
-
-        if len(experts) <= self._expert_pager_cache.num_slots:
+        # Choose the path from the shape alone, so capture and replay of the
+        # graph take the same path.
+        if topk_ids.numel() <= table.num_slots:
             slabs = self._expert_pager_cache_slab
-            slots, misses = self._expert_pager_cache.acquire(experts)
-            for i in misses:
-                self._expert_pager_load(slabs, slots[i], experts[i])
+            dst_rows = self._expert_pager_cache_rows
+            expert_map, dst_row, todo = table.acquire(topk_ids)
+            cached_row = table.no_cache  # read everything from UVA
         else:
-            # Does not fit in the slots, so use the working buffer without
-            # updating the cache.
+            # May not fit in the slots, so use the working buffer without
+            # updating the table. Experts that hit are copied from the cache
+            # slab within VRAM.
             slabs = self._expert_pager_working_slab
-            slots = list(range(len(experts)))
-            for slot, expert in enumerate(experts):
-                cached = self._expert_pager_cache.peek(expert)
-                if cached is None:
-                    self._expert_pager_load(slabs, slot, expert)
-                else:
-                    self._expert_pager_reuse(slabs, slot, cached)
+            dst_rows = self._expert_pager_working_rows
+            expert_map, dst_row, cached_row, todo = table.lookup(topk_ids)
 
-        self._expert_pager_map_host.fill_(-1)
-        if experts:
-            self._expert_pager_map_host[experts] = torch.tensor(
-                slots, dtype=torch.int32
+        for name in slabs:
+            gather_rows(
+                todo,
+                dst_row,
+                cached_row,
+                self._expert_pager_src_rows[name],
+                self._expert_pager_cache_rows[name],
+                dst_rows[name],
             )
-        self._expert_pager_map.copy_(self._expert_pager_map_host, non_blocking=True)
+        self._expert_pager_map.copy_(expert_map)
 
-        self._expert_pager_log(len(experts))
+        self._expert_pager_log()
 
         saved = {name: param.data for name, param in self._expert_pager_params.items()}
         try:
@@ -248,19 +247,23 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             "would not be staged."
         )
 
-    def _expert_pager_log(self, num_experts: int) -> None:
+    def _expert_pager_log(self) -> None:
         self._expert_pager_calls += 1
         if LOG_INTERVAL <= 0 or self._expert_pager_calls % LOG_INTERVAL:
             return
-        cache = self._expert_pager_cache
-        total = cache.hits + cache.misses
+        # Reading the counters is a device -> host sync, which is not allowed
+        # during capture.
+        if torch.cuda.is_current_stream_capturing():
+            return
+        table = self._expert_pager_table
+        hits, misses = torch.stack([table.hits, table.misses]).tolist()
+        total = hits + misses
         logger.info(
-            "vllm-expert-pager %s: hit %.1f%% (%d/%d), last |U|=%d",
+            "vllm-expert-pager %s: hit %.1f%% (%d/%d)",
             self.layer_name,
-            100.0 * cache.hits / total if total else 0.0,
-            cache.hits,
+            100.0 * hits / total if total else 0.0,
+            hits,
             total,
-            num_experts,
         )
 
 
