@@ -2,8 +2,10 @@
 
 The source is either the RAM tier (pinned memory seen from the device as a UVA
 view) or the cache slab; the destination is the cache slab or the working
-buffer. Which experts to copy is passed as index tensors on the device, so the
-host needs to know nothing and the kernels run under CUDA graphs.
+buffer. Scales (VRAM resident, in expert order) are copied to the same slot,
+because the MoE kernel indexes weights and scales with the same slot number.
+Which experts to copy is passed as index tensors on the device, so the host
+needs to know nothing and the kernels run under CUDA graphs.
 
 The SMs copy with loads and stores instead of ``cudaMemcpyAsync``. A memcpy has
 fixed addresses, so putting one in a graph would mean "copy the same expert
@@ -19,29 +21,18 @@ _BLOCK = 4096
 
 
 @triton.jit
-def _gather_rows_kernel(
-    todo_ptr,  # int64[K]  experts to copy. -1 is an empty entry
-    dst_row_ptr,  # int64[E]  expert -> destination row
-    cache_row_ptr,  # int64[E]  expert -> row on the cache slab; -1 reads from RAM
-    src_row_ptr,  # int64[E]  expert -> RAM-tier row (before adding base)
-    base,  # added to RAM-tier rows (first row of the layer)
+def _copy_row(
+    chunk,
+    W,  # words per row
     src_ptr,  # int32[*, W]  RAM tier (UVA view)
     cache_ptr,  # int32[S, W]  cache slab
     dst_ptr,  # int32[*, W]  destination
-    W,  # words per row
+    src_row,
+    cache_row,
+    dst_row,
+    active,
     BLOCK: tl.constexpr,
 ):
-    j = tl.program_id(0)
-    chunk = tl.program_id(1)
-
-    e = tl.load(todo_ptr + j)
-    active = e >= 0
-    # Keep the index in range for empty entries; the value read is discarded.
-    e = tl.maximum(e, 0)
-    dst_row = tl.maximum(tl.load(dst_row_ptr + e), 0)
-    cache_row = tl.load(cache_row_ptr + e)
-    src_row = tl.load(src_row_ptr + e) + base
-
     offs = chunk * BLOCK + tl.arange(0, BLOCK)
     in_row = active & (offs < W)
     from_cache = in_row & (cache_row >= 0)
@@ -54,6 +45,60 @@ def _gather_rows_kernel(
     x_src = tl.load(src_ptr + src_row * W + offs, mask=from_src, other=0)
     x = tl.where(cache_row >= 0, x_cache, x_src)
     tl.store(dst_ptr + dst_row * W + offs, x, mask=in_row)
+
+
+@triton.jit
+def _copy_scale(
+    SW,  # words per scale row
+    scale_ptr,  # int32[E, SW]  scales of every expert (VRAM resident)
+    sdst_ptr,  # int32[*, SW]  scales in slot order
+    e,
+    dst_row,
+    active,
+    SBLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, SBLOCK)
+    m = active & (offs < SW)
+    x = tl.load(scale_ptr + e * SW + offs, mask=m, other=0)
+    tl.store(sdst_ptr + dst_row * SW + offs, x, mask=m)
+
+
+@triton.jit
+def _gather_rows_kernel(
+    todo_ptr,  # int64[K]  experts to copy. -1 is an empty entry
+    dst_row_ptr,  # int64[E]  expert -> destination row
+    cache_row_ptr,  # int64[E]  expert -> row on the cache slab; -1 reads from RAM
+    src_row_ptr,  # int64[E]  expert -> RAM-tier row (before adding base)
+    base,  # added to RAM-tier rows (first row of the layer)
+    src0_ptr, cache0_ptr, dst0_ptr, W0, C0,  # name 0 (w13). C0 is the chunk count
+    src1_ptr, cache1_ptr, dst1_ptr, W1,  # name 1 (w2)
+    scale0_ptr, sdst0_ptr, SW0,  # scales of name 0
+    scale1_ptr, sdst1_ptr, SW1,  # scales of name 1
+    BLOCK: tl.constexpr,
+    SBLOCK: tl.constexpr,
+):  # fmt: skip
+    j = tl.program_id(0)
+    c = tl.program_id(1)
+
+    e = tl.load(todo_ptr + j)
+    active = e >= 0
+    # Keep the index in range for empty entries; the value read is discarded.
+    e = tl.maximum(e, 0)
+    dst_row = tl.maximum(tl.load(dst_row_ptr + e), 0)
+    cache_row = tl.load(cache_row_ptr + e)
+    src_row = tl.load(src_row_ptr + e) + base
+
+    # Weights are copied per name in chunks of BLOCK words. The program for the
+    # first chunk of each name copies that name's whole scale row (it only needs
+    # updating when the slot's contents change).
+    if c < C0:
+        _copy_row(c, W0, src0_ptr, cache0_ptr, dst0_ptr, src_row, cache_row, dst_row, active, BLOCK)  # fmt: skip
+        if c == 0:
+            _copy_scale(SW0, scale0_ptr, sdst0_ptr, e, dst_row, active, SBLOCK)
+    else:
+        _copy_row(c - C0, W1, src1_ptr, cache1_ptr, dst1_ptr, src_row, cache_row, dst_row, active, BLOCK)  # fmt: skip
+        if c == C0:
+            _copy_scale(SW1, scale1_ptr, sdst1_ptr, e, dst_row, active, SBLOCK)
 
 
 @triton.jit
@@ -110,21 +155,30 @@ def gather_rows(
     cache_row: torch.Tensor,
     src_row: torch.Tensor,
     base: int,
-    src: torch.Tensor,
-    cache: torch.Tensor,
-    dst: torch.Tensor,
+    src: list[torch.Tensor],
+    cache: list[torch.Tensor],
+    dst: list[torch.Tensor],
+    scale: list[torch.Tensor],
+    scale_dst: list[torch.Tensor],
 ) -> None:
-    """Copy the rows of the experts listed in ``todo`` into ``dst``.
+    """Copy the rows and scales of the experts in ``todo`` into ``dst`` / ``scale_dst``.
 
-    ``src``, ``cache`` and ``dst`` are ``(*, W)`` int32 views made by
-    ``as_rows``. ``cache_row`` decides whether each row is read from ``cache``
-    or ``src``.
+    Each list has two elements in name order (w13, w2), each a ``(*, W)`` int32
+    view made by ``as_rows``. ``cache_row`` decides whether a row is read from
+    ``cache`` or ``src``. Scales are always read from ``scale`` (every expert).
     """
-    W = src.shape[1]
-    grid = (todo.shape[0], triton.cdiv(W, _BLOCK))
+    W0, W1 = src[0].shape[1], src[1].shape[1]
+    C0, C1 = triton.cdiv(W0, _BLOCK), triton.cdiv(W1, _BLOCK)
+    SW0, SW1 = scale[0].shape[1], scale[1].shape[1]
+    grid = (todo.shape[0], C0 + C1)
     _gather_rows_kernel[grid](
-        todo, dst_row, cache_row, src_row, base, src, cache, dst, W, BLOCK=_BLOCK
-    )
+        todo, dst_row, cache_row, src_row, base,
+        src[0], cache[0], dst[0], W0, C0,
+        src[1], cache[1], dst[1], W1,
+        scale[0], scale_dst[0], SW0,
+        scale[1], scale_dst[1], SW1,
+        BLOCK=_BLOCK, SBLOCK=1 << (max(SW0, SW1) - 1).bit_length(),
+    )  # fmt: skip
 
 
 def fetch_rows(

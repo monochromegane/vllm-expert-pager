@@ -46,12 +46,12 @@ SSD_PATH = os.environ.get("VLLM_EXPERT_PAGER_SSD_PATH")
 LOG_INTERVAL = int(os.environ.get("VLLM_EXPERT_PAGER_LOG_INTERVAL", "1000"))
 
 # Expert weights referenced through the slab. Scales stay resident in VRAM and
-# are shown reordered by slot.
+# a copy in slot order is shown alongside the weights.
 PARAMS = ("w13_weight", "w2_weight")
 
 _store: Store | None = None
-# Working buffer shared across all layers. Layers run sequentially on the same
-# stream, so there is no cross-layer race.
+# Working buffer (weights and scales) shared across all layers. Layers run
+# sequentially on the same stream, so there is no cross-layer race.
 _working_slab: dict[str, torch.Tensor] | None = None
 
 
@@ -208,6 +208,7 @@ class ExpertPagerRoutedExperts(RoutedExperts):
 
     def _expert_pager_setup(self) -> None:
         # triton only exists in GPU environments, so import it here.
+        from vllm_expert_pager.acquire import AcquirePair
         from vllm_expert_pager.gather import as_rows
 
         store = self._expert_pager_store
@@ -233,40 +234,18 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         R = store.ram_slots
         self._expert_pager_ram.slot_of[:R] = self._expert_pager_ram.experts[:R]
         self._expert_pager_ram.expert_in[:R] = self._expert_pager_ram.experts[:R]
-
-        self._expert_pager_cache_slab = {
-            name: torch.empty((CACHE_SLOTS, *p.shape[1:]), dtype=p.dtype, device=device)
-            for name, p in params.items()
-        }
-        global _working_slab
-        if _working_slab is None:
-            _working_slab = {
-                name: torch.empty((E, *p.shape[1:]), dtype=p.dtype, device=device)
-                for name, p in params.items()
-            }
-        for name, p in params.items():
-            if _working_slab[name].shape[1:] != p.shape[1:]:
-                raise RuntimeError(
-                    f"{self.layer_name}: {name} shape differs from other layers"
-                )
-        self._expert_pager_working_slab = _working_slab
-
-        # (S, W) / (E, W) int32 views handed to the gather kernel.
-        self._expert_pager_cache_rows = {
-            n: as_rows(t) for n, t in self._expert_pager_cache_slab.items()
-        }
-        self._expert_pager_working_rows = {
-            n: as_rows(t) for n, t in _working_slab.items()
-        }
-
-        # The expert_map read by the kernel. int32 at a fixed address, updated
-        # with copy_ every step.
-        self._expert_pager_map = torch.empty((E,), dtype=torch.int32, device=device)
+        # For decode (K <= S) both tables are updated by one kernel.
+        self._expert_pager_acquire = AcquirePair(
+            self._expert_pager_table, self._expert_pager_ram
+        )
+        # The expert_map read by the kernel. int32 at a fixed address. acquire
+        # writes it directly; the lookup path updates it with copy_.
+        self._expert_pager_map = self._expert_pager_acquire.expert_map
 
         # Scales stay in VRAM as (E, ...). The kernel indexes scales with the
         # same slot number as the weights (off_experts in fused_moe_kernel), so
-        # show it a copy reordered by slot every step. The trailing row is the
-        # sink for experts that are not needed (as in table.py).
+        # keep a copy in slot order alongside the slab and let gather copy it
+        # together with the weights.
         scale_name = getattr(self.quant_method, "weight_scale_name", None)
         if scale_name is None:
             raise RuntimeError(
@@ -274,16 +253,40 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 "weight_scale_name; vllm-expert-pager only knows how to stage FP8 "
                 "scales"
             )
-        scales = {
-            f"{w}_{scale_name}": getattr(self, f"{w}_{scale_name}")
-            for w in ("w13", "w2")
+        # Same order as PARAMS (w13, w2). gather takes two-element lists in this
+        # order.
+        self._expert_pager_scale_names = [f"{w}_{scale_name}" for w in ("w13", "w2")]
+        scales = {name: getattr(self, name) for name in self._expert_pager_scale_names}
+        staged = {**params, **scales}
+
+        self._expert_pager_cache_slab = {
+            name: torch.empty((CACHE_SLOTS, *p.shape[1:]), dtype=p.dtype, device=device)
+            for name, p in staged.items()
         }
-        self._expert_pager_scale_full = {name: p.data for name, p in scales.items()}
-        self._expert_pager_scale_slab = {
-            name: torch.empty((E + 1, *p.shape[1:]), dtype=p.dtype, device=device)
-            for name, p in scales.items()
-        }
-        self._expert_pager_params = {**params, **scales}
+        global _working_slab
+        if _working_slab is None:
+            _working_slab = {
+                name: torch.empty((E, *p.shape[1:]), dtype=p.dtype, device=device)
+                for name, p in staged.items()
+            }
+        for name, p in staged.items():
+            if _working_slab[name].shape[1:] != p.shape[1:]:
+                raise RuntimeError(
+                    f"{self.layer_name}: {name} shape differs from other layers"
+                )
+        self._expert_pager_working_slab = _working_slab
+
+        # (S, W) / (E, W) int32 views handed to the gather kernel, as lists in
+        # name order.
+        order = list(PARAMS) + self._expert_pager_scale_names
+        self._expert_pager_cache_rows = [
+            as_rows(self._expert_pager_cache_slab[n]) for n in order
+        ]
+        self._expert_pager_working_rows = [as_rows(_working_slab[n]) for n in order]
+        self._expert_pager_scale_rows = [
+            as_rows(scales[n].data) for n in self._expert_pager_scale_names
+        ]
+        self._expert_pager_params = staged
 
         logger.info_once(
             "vllm-expert-pager: %d cache slots/layer, %d RAM slots/layer, %s",
@@ -312,12 +315,20 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         R, layer = store.ram_slots, self._expert_pager_layer
 
         # Choose the path from the shape alone, so capture and replay of the
-        # graph take the same path.
+        # graph take the same path. The RAM tier follows the same rule as the
+        # VRAM tier and is touched every step, so RAM stays a superset of VRAM.
         if K <= vram.num_slots:
+            # Decode. Both tables are updated by one kernel, and expert_map is
+            # written directly into self._expert_pager_map.
             slabs = self._expert_pager_cache_slab
             dst_rows = self._expert_pager_cache_rows
-            expert_map, dst_row, todo = vram.acquire(topk_ids)
+            todo, ssd_todo = self._expert_pager_acquire(topk_ids)
+            dst_row, src_row = (
+                self._expert_pager_acquire.vram_slot,
+                self._expert_pager_acquire.ram_slot,
+            )
             cached_row = vram.no_cache  # read everything from the RAM tier
+            base = layer * R
         else:
             # May not fit in the slots, so use the working buffer without
             # updating the table. Experts that hit are copied from the cache
@@ -325,21 +336,19 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             slabs = self._expert_pager_working_slab
             dst_rows = self._expert_pager_working_rows
             expert_map, dst_row, cached_row, todo = vram.lookup(topk_ids)
-
-        # The RAM tier follows the same rule. It is touched every step, so RAM
-        # stays a superset of VRAM.
-        if K <= R:
-            _, src_row, ssd_todo = ram.acquire(topk_ids)
-            base = layer * R
-        else:
-            # Does not fit in the RAM tier (prefill). Misses are read into the
-            # shared working rows.
-            _, packed, in_ram, need = ram.lookup(topk_ids)
-            src_row = torch.where(
-                in_ram >= 0, in_ram + layer * R, packed + store.working_base
-            )
-            ssd_todo = torch.where(in_ram[need.clamp(min=0)] >= 0, -1, need)
-            base = 0
+            self._expert_pager_map.copy_(expert_map)
+            if K <= R:
+                _, src_row, ssd_todo = ram.acquire(topk_ids)
+                base = layer * R
+            else:
+                # Does not fit in the RAM tier (prefill). Misses are read into
+                # the shared working rows.
+                _, packed, in_ram, need = ram.lookup(topk_ids)
+                src_row = torch.where(
+                    in_ram >= 0, in_ram + layer * R, packed + store.working_base
+                )
+                ssd_todo = torch.where(in_ram[need.clamp(min=0)] >= 0, -1, need)
+                base = 0
         fetch_rows(ssd_todo, src_row, base, layer, store)
         if store.path is not None and not torch.cuda.is_current_stream_capturing():
             # In eager mode Python keeps queuing kernels for later layers, and
@@ -351,33 +360,25 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             # so it needs none of this.
             torch.cuda.current_stream().synchronize()
 
-        for name in slabs:
-            gather_rows(
-                todo,
-                dst_row,
-                cached_row,
-                src_row,
-                base,
-                store.view[name],
-                self._expert_pager_cache_rows[name],
-                dst_rows[name],
-            )
-        self._expert_pager_map.copy_(expert_map)
-        sink = torch.where(expert_map >= 0, expert_map, self.global_num_experts)
-        for name, full in self._expert_pager_scale_full.items():
-            self._expert_pager_scale_slab[name].index_put_((sink,), full)
+        gather_rows(
+            todo,
+            dst_row,
+            cached_row,
+            src_row,
+            base,
+            [store.view[n] for n in PARAMS],
+            self._expert_pager_cache_rows[:2],
+            dst_rows[:2],
+            self._expert_pager_scale_rows,
+            dst_rows[2:],
+        )
 
         self._expert_pager_log()
 
-        rows = slabs["w13_weight"].shape[0]
-        staged = {
-            **slabs,
-            **{n: t[:rows] for n, t in self._expert_pager_scale_slab.items()},
-        }
         saved = {name: param.data for name, param in self._expert_pager_params.items()}
         try:
             for name, param in self._expert_pager_params.items():
-                param.data = staged[name]
+                param.data = slabs[name]
             self._expert_pager_expert_map = self._expert_pager_map
             return super().forward_modular(
                 x=x,
