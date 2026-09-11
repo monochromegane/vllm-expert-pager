@@ -17,7 +17,9 @@ once the host has finished reading it writes the same value to done. The GPU
 side is the fetch kernel in gather.py.
 """
 
+import faulthandler
 import os
+import signal
 import threading
 import time
 import traceback
@@ -42,6 +44,9 @@ _PINNED_ROUND_LIMIT_MB = 1024
 # request and saturates at about 4.7 GB/s from eight requests on. Splitting one
 # record into pieces does not make it faster.
 _READ_WORKERS = 8
+# Warn when serving one request takes longer than this (to tell a stall from
+# slow I/O).
+_SLOW_SECONDS = 1.0
 
 
 def _pinned_aligned(rows: int, words: int) -> torch.Tensor:
@@ -157,6 +162,11 @@ class Store:
         self._pool = ThreadPoolExecutor(
             max_workers=_READ_WORKERS, thread_name_prefix="vllm-expert-pager-read"
         )
+        # For diagnosing a stall: kill -USR2 <EngineCore pid> dumps the Python
+        # stack of every thread to stderr (the server log). It works even when
+        # a thread is spinning in C code while holding the GIL.
+        if threading.current_thread() is threading.main_thread():
+            faulthandler.register(signal.SIGUSR2, all_threads=True)
         threading.Thread(
             target=self._serve, daemon=True, name="vllm-expert-pager-ssd"
         ).start()
@@ -210,6 +220,14 @@ class Store:
             futures = [self._pool.submit(self._read, layer, e, row) for e, row in pairs]
             # Even when a read fails, write done only after all of them finished.
             wait(futures)
+            if time.perf_counter() - t0 > _SLOW_SECONDS:
+                logger.warning(
+                    "vllm-expert-pager: seq %d layer %d: %d SSD reads took %.1f s",
+                    seq,
+                    layer,
+                    len(pairs),
+                    time.perf_counter() - t0,
+                )
             try:
                 for f in futures:
                     f.result()
