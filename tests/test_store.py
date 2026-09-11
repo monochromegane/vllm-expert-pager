@@ -14,8 +14,8 @@ pytest.importorskip("triton")
 if not torch.cuda.is_available() or not hasattr(os, "O_DIRECT"):
     pytest.skip("needs CUDA and O_DIRECT", allow_module_level=True)
 
-from vllm_expert_pager.gather import fetch_rows
-from vllm_expert_pager.store import Store
+from vllm_expert_pager.gather import fetch_rows, gather_rows
+from vllm_expert_pager.store import _READ_WORKERS, Store
 
 L, E, R = 2, 8, 4
 ROW_BYTES = {"w13_weight": 8192, "w2_weight": 4096}
@@ -28,16 +28,42 @@ def pattern(layer: int, expert: int, name: str) -> torch.Tensor:
     )
 
 
-@pytest.fixture
-def store(tmp_path):
+def make_store(tmp_path, num_layers: int, num_experts: int, ram_slots: int) -> Store:
     s = Store(
-        L, E, R, ROW_BYTES, str(tmp_path / "expert_pager.bin"), torch.device("cuda")
+        num_layers,
+        num_experts,
+        ram_slots,
+        ROW_BYTES,
+        str(tmp_path / "expert_pager.bin"),
+        torch.device("cuda"),
     )
-    for layer in range(L):
-        for e in range(E):
+    for layer in range(num_layers):
+        for e in range(num_experts):
             for name in ROW_BYTES:
                 s.write(layer, e, name, pattern(layer, e, name))
     return s
+
+
+@pytest.fixture
+def store(tmp_path):
+    return make_store(tmp_path, L, E, R)
+
+
+def capture_fetch(store: Store, todo, row, layer: int) -> torch.cuda.CUDAGraph:
+    """Capture fetch into a graph.
+
+    Only addresses are baked into the graph; the contents are swapped before
+    replay.
+    """
+    base = layer * store.ram_slots
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        fetch_rows(todo, row, base, layer, store)  # warmup (empty request)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            fetch_rows(todo, row, base, layer, store)
+    torch.cuda.synchronize()
+    return g
 
 
 def test_warm_start_rows(store):
@@ -54,15 +80,7 @@ def test_fetch_reads_missing_experts_in_graph(store):
     todo = torch.full((R,), -1, dtype=torch.int64, device=dev)
     row = torch.zeros((E,), dtype=torch.int64, device=dev)
     layer = 1
-
-    # Only addresses are baked into the graph; swap the contents and replay.
-    s = torch.cuda.Stream()
-    with torch.cuda.stream(s):
-        fetch_rows(todo, row, layer * R, layer, store)  # warmup (empty request)
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=s):
-            fetch_rows(todo, row, layer * R, layer, store)
-    torch.cuda.synchronize()
+    g = capture_fetch(store, todo, row, layer)
 
     for i in range(20):
         # Experts 4..7 are not in RAM. Read them into slots i % R and (i+1) % R.
@@ -80,6 +98,7 @@ def test_fetch_reads_missing_experts_in_graph(store):
             assert torch.equal(
                 store.pinned[name][layer * R + sb], pattern(layer, b, name)
             )
+    assert store.fetches == 20 and store.reads == 40
 
     # An empty request never reaches the host.
     seq_before = int(store.req[0])
@@ -87,6 +106,107 @@ def test_fetch_reads_missing_experts_in_graph(store):
     g.replay()
     torch.cuda.synchronize()
     assert int(store.req[0]) == seq_before
+
+
+def test_gather_with_fetch_copies_ram_hits_while_reading_ssd(store):
+    # The decode shape: the first launch asks for the SSD read while copying
+    # the experts that are in RAM, and the second launch copies the experts
+    # once they are read. Driven through graph replay.
+    dev = torch.device("cuda")
+    layer, S = 1, 3
+    base = layer * R
+    W = [n // 4 for n in ROW_BYTES.values()]
+    src = [store.view[name] for name in ROW_BYTES]
+    cache = [torch.zeros((S, w), dtype=torch.int32, device=dev) for w in W]
+    dst = [torch.zeros((S, w), dtype=torch.int32, device=dev) for w in W]
+    scale = [
+        torch.arange(E * 8, dtype=torch.int32, device=dev).view(E, 8) * (i + 1)
+        for i in range(2)
+    ]
+    scale_dst = [torch.zeros((S, 8), dtype=torch.int32, device=dev) for _ in range(2)]
+    todo = torch.full((S,), -1, dtype=torch.int64, device=dev)  # VRAM misses
+    ssd = torch.full((S,), -1, dtype=torch.int64, device=dev)  # those read from SSD
+    dst_row = torch.zeros((E,), dtype=torch.int64, device=dev)
+    cache_row = torch.full((E,), -1, dtype=torch.int64, device=dev)
+    src_row = torch.zeros((E,), dtype=torch.int64, device=dev)
+
+    def step() -> None:
+        gather_rows(todo, dst_row, cache_row, src_row, base, src, cache, dst, scale, scale_dst,
+                    fetch=(ssd, layer, store))  # fmt: skip
+        gather_rows(
+            ssd, dst_row, cache_row, src_row, base, src, cache, dst, scale, scale_dst
+        )
+
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        step()  # warmup (empty request)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            step()
+    torch.cuda.synchronize()
+
+    for i in range(6):
+        # Experts a (< R, RAM slot a) and b (< R) come from RAM; expert c (>= R)
+        # is first read from SSD into RAM slot R-1. Slab rows: a -> 0, c -> 1,
+        # b -> 2.
+        a, b, c = i % 2, 2, R + i % (E - R)
+        todo.copy_(torch.tensor([a, c, b], device=dev))
+        ssd.copy_(torch.tensor([c, -1, -1], device=dev))
+        src_row[a], src_row[b], src_row[c] = a, b, R - 1
+        dst_row[a], dst_row[c], dst_row[b] = 0, 1, 2
+        dst[0].zero_(), dst[1].zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert store.failed is None, store.failed
+        for k, name in enumerate(ROW_BYTES):
+            assert torch.equal(dst[k][0], pattern(layer, a, name).to(dev))
+            assert torch.equal(dst[k][1], pattern(layer, c, name).to(dev))
+            assert torch.equal(dst[k][2], pattern(layer, b, name).to(dev))
+            assert torch.equal(scale_dst[k][0], scale[k][a])
+            assert torch.equal(scale_dst[k][1], scale[k][c])
+            assert torch.equal(scale_dst[k][2], scale[k][b])
+    assert store.fetches == 6 and store.reads == 6
+
+
+def test_fetch_reads_many_experts_at_once(tmp_path):
+    # Read more experts than there are threads in one request and check that
+    # done is written only once all of them are in. Expert R+s goes to slot s.
+    E2, R2 = 4 * _READ_WORKERS, 2 * _READ_WORKERS
+    store = make_store(tmp_path, 1, E2, R2)
+    dev = torch.device("cuda")
+    todo = torch.full((R2,), -1, dtype=torch.int64, device=dev)
+    row = torch.zeros((E2,), dtype=torch.int64, device=dev)
+    g = capture_fetch(store, todo, row, 0)
+
+    missing = list(range(R2, E2))
+    todo.copy_(torch.tensor(missing, device=dev))
+    row[R2:] = torch.arange(R2, device=dev)
+    g.replay()
+    torch.cuda.synchronize()
+    assert store.failed is None, store.failed
+    assert store.fetches == 1 and store.reads == R2
+    for s, e in enumerate(missing):
+        for name in ROW_BYTES:
+            assert torch.equal(store.pinned[name][s], pattern(0, e, name))
+
+
+def test_failed_read_releases_gpu(store):
+    # Make one read fail by pointing its row outside the RAM tier. The host
+    # finishes the other reads, then writes done and releases the GPU (without
+    # that, synchronize would never return).
+    dev = torch.device("cuda")
+    todo = torch.full((R,), -1, dtype=torch.int64, device=dev)
+    row = torch.zeros((E,), dtype=torch.int64, device=dev)
+    layer = 1
+    g = capture_fetch(store, todo, row, layer)
+
+    todo.copy_(torch.tensor([4, 5, -1, -1], device=dev))
+    row[4], row[5] = 10**6, 0
+    g.replay()
+    torch.cuda.synchronize()
+    assert store.failed is not None and "IndexError" in store.failed
+    for name in ROW_BYTES:
+        assert torch.equal(store.pinned[name][layer * R + 0], pattern(layer, 5, name))
 
 
 def test_large_pinned_is_not_rounded_to_pow2(store):

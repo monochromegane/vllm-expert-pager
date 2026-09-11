@@ -7,8 +7,9 @@ across layers so the gather kernel has a single source.
 
 The SSD tier is a paging file of fixed-length records (the w13 row followed by
 the w2 row) in [layer][expert] order. weight_loader writes it at load time; at
-inference a host thread serves requests from the GPU with O_DIRECT preadv.
-O_DIRECT keeps the page cache from holding a second copy of the RAM tier.
+inference a host thread serves requests from the GPU with O_DIRECT preadv, and
+the experts of one layer are read concurrently by a thread pool. O_DIRECT keeps
+the page cache from holding a second copy of the RAM tier.
 
 The GPU and host communicate through two words in pinned memory. The GPU writes
 a request (layer, and the list of experts and rows) and advances req[0] (seq);
@@ -16,10 +17,13 @@ once the host has finished reading it writes the same value to done. The GPU
 side is the fetch kernel in gather.py.
 """
 
+import faulthandler
 import os
+import signal
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import torch
 from vllm.logger import init_logger
@@ -35,6 +39,14 @@ _ALIGN = 4096
 # allocation, so a 20.5 GiB request would consume 32 GiB. Change the allocator
 # setting so pinned allocations of this size or more are not rounded.
 _PINNED_ROUND_LIMIT_MB = 1024
+# Number of threads that read the experts of one layer concurrently. The NVMe
+# of the test machine (WSL2) delivers about 2.9 GB/s with a single outstanding
+# request and saturates at about 4.7 GB/s from eight requests on. Splitting one
+# record into pieces does not make it faster.
+_READ_WORKERS = 8
+# Warn when serving one request takes longer than this (to tell a stall from
+# slow I/O).
+_SLOW_SECONDS = 1.0
 
 
 def _pinned_aligned(rows: int, words: int) -> torch.Tensor:
@@ -126,6 +138,11 @@ class Store:
         # Traceback of an I/O failure on the host thread. forward checks it and
         # raises.
         self.failed: str | None = None
+        # Statistics. fetches counts the requests, reads the experts read, and
+        # io_seconds the total time from seeing a request to writing done. Only
+        # the host thread writes them.
+        self.fetches = self.reads = 0
+        self.io_seconds = 0.0
 
         self.path = path if R < E else None
         self.fd_w = self.fd_r = None
@@ -142,6 +159,14 @@ class Store:
             logger.info(
                 "vllm-expert-pager: paging file %s (%.1f GiB)", path, size / 2**30
             )
+        self._pool = ThreadPoolExecutor(
+            max_workers=_READ_WORKERS, thread_name_prefix="vllm-expert-pager-read"
+        )
+        # For diagnosing a stall: kill -USR2 <EngineCore pid> dumps the Python
+        # stack of every thread to stderr (the server log). It works even when
+        # a thread is spinning in C code while holding the GIL.
+        if threading.current_thread() is threading.main_thread():
+            faulthandler.register(signal.SIGUSR2, all_threads=True)
         threading.Thread(
             target=self._serve, daemon=True, name="vllm-expert-pager-ssd"
         ).start()
@@ -183,16 +208,35 @@ class Store:
             if seq == last:
                 time.sleep(50e-6)
                 continue
-            try:
-                layer = int(req[1])
+            t0 = time.perf_counter()
+            layer = int(req[1])
+            pairs = [
+                (e, row)
                 for e, row in zip(
                     req[2 : 2 + B].tolist(), req[2 + B : 2 + 2 * B].tolist()
-                ):
-                    if e >= 0:
-                        self._read(layer, e, row)
+                )
+                if e >= 0
+            ]
+            futures = [self._pool.submit(self._read, layer, e, row) for e, row in pairs]
+            # Even when a read fails, write done only after all of them finished.
+            wait(futures)
+            if time.perf_counter() - t0 > _SLOW_SECONDS:
+                logger.warning(
+                    "vllm-expert-pager: seq %d layer %d: %d SSD reads took %.1f s",
+                    seq,
+                    layer,
+                    len(pairs),
+                    time.perf_counter() - t0,
+                )
+            try:
+                for f in futures:
+                    f.result()
             except Exception:  # noqa: BLE001  keep the thread alive; always release the GPU
                 self.failed = traceback.format_exc()
                 logger.error("vllm-expert-pager: SSD read failed\n%s", self.failed)
+            self.fetches += 1
+            self.reads += len(pairs)
+            self.io_seconds += time.perf_counter() - t0
             # Release the GPU even on failure. The next forward that runs Python
             # sees failed and stops.
             done[0] = seq

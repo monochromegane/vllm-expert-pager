@@ -3,7 +3,7 @@
 vllm-expert-pager is a vLLM plugin for running Mixture-of-Experts (MoE) models
 whose expert weights do not fit in GPU memory. It pages expert weights on
 demand between VRAM, host RAM, and optionally SSD. Recently used experts stay
-cached. On an RTX 4090 (24 GB), a 35B-A3B FP8 model decodes 3.7 times faster
+cached. On an RTX 4090 (24 GB), a 35B-A3B FP8 model decodes 5.4 times faster
 than with vLLM's `--cpu-offload-gb` at the same VRAM budget (see Results).
 
 ## How it works
@@ -54,15 +54,17 @@ needed expert.
 
 ## Requirements
 
-- vLLM 0.28.0. The plugin hooks vLLM internals (`RoutedExperts` and the FP8
-  MoE method), so other versions may not work.
+- vLLM 0.29.0 (0.28.0 also works). The plugin hooks vLLM internals
+  (`RoutedExperts` and the FP8 MoE method), so other versions may not work.
 - A MoE model whose expert weights are stored in FP8, served with vLLM's `fp8`
   quantization method. Tested with `Qwen/Qwen3.6-35B-A3B-FP8` on an RTX 4090
   (24 GB) using the Triton FP8 MoE backend.
 - A single GPU. Tensor parallelism and expert parallelism are not supported.
 - Linux. The SSD tier opens the paging file with `O_DIRECT`, so it has to be
   on a filesystem that supports it (ext4 does; `/mnt/c` under WSL2 does not).
-  WSL2 itself works.
+  WSL2 itself works, but vLLM 0.29.0 needs `VLLM_WSL2_ENABLE_PIN_MEMORY=1`
+  there: its model runner requires pinned host memory, which vLLM disables on
+  WSL2 by default.
 - Python 3.10 or later.
 
 ## Usage
@@ -107,28 +109,27 @@ per expert):
 
 ## Results
 
-Measured on an RTX 4090 (24 GB) under WSL2 with vLLM 0.28.0 and
+Measured on an RTX 4090 (24 GB) under WSL2 with vLLM 0.29.0 and
 `Qwen/Qwen3.6-35B-A3B-FP8`, started with `--max-model-len 4096
 --max-num-seqs 1` and vLLM's default CUDA graph mode. The client is
 `vllm bench serve` with one concurrent request, 1024 input and 256 output
-tokens, 4 prompts. TPOT is the time per output token, TTFT the time to first
-token. The baseline is vLLM's own `--cpu-offload-gb`.
+tokens, 4 prompts; each configuration was run twice and the second run is
+reported. TPOT is the time per output token, TTFT the time to first token.
+The baseline is vLLM's own `--cpu-offload-gb`.
 
 | Configuration | VRAM for experts | Pinned RAM | SSD | TPOT | TTFT | Output tok/s |
 |---|---|---|---|---|---|---|
-| `--cpu-offload-gb 32` (every expert on CPU) | 0 GiB | 30 GiB | - | 87.4 ms | 2575 ms | 10.3 |
-| `--cpu-offload-gb 17` | 13.0 GiB | 17 GiB | - | 55.8 ms | 1684 ms | 16.1 |
-| `CACHE_SLOTS=32`, `RAM_SLOTS=256` | 4.6 GiB | 30.75 GiB | - | 25.7 ms | 1588 ms | 31.4 |
-| `CACHE_SLOTS=102`, `RAM_SLOTS=256` | 12.8 GiB | 30.75 GiB | - | 14.9 ms | 1009 ms | 53.2 |
-| `CACHE_SLOTS=32`, `RAM_SLOTS=128` | 4.6 GiB | 15.75 GiB | 30 GiB | 39.4 ms | 4428 ms | 17.7 |
+| `--cpu-offload-gb 32` (every expert on CPU) | 0 GiB | 30 GiB | - | 88.6 ms | 2671 ms | 10.1 |
+| `--cpu-offload-gb 17` | 13.0 GiB | 17 GiB | - | 52.1 ms | 1647 ms | 17.1 |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=256` | 4.6 GiB | 30.75 GiB | - | 20.7 ms | 1511 ms | 37.7 |
+| `CACHE_SLOTS=102`, `RAM_SLOTS=256` | 12.8 GiB | 30.75 GiB | - | 9.6 ms | 1025 ms | 73.8 |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=128` | 4.6 GiB | 15.75 GiB | 30 GiB | 27.7 ms | 3237 ms | 24.9 |
 
 - With about the same VRAM footprint (`CACHE_SLOTS=102` against
-  `--cpu-offload-gb 17`), decoding is 3.7 times faster. Against offloading
-  every expert it is 5.9 times faster.
-- The SSD tier costs about 14 ms per token at `RAM_SLOTS=128`, and TTFT grows
+  `--cpu-offload-gb 17`), decoding is 5.4 times faster. Against offloading
+  every expert it is 9.2 times faster.
+- The SSD tier costs about 7 ms per token at `RAM_SLOTS=128`, and TTFT grows
   because prefill reads every expert that is not in RAM.
-- vLLM ships no tuned FP8 GEMM config for the RTX 4090. With one (independent
-  of this plugin), `CACHE_SLOTS=102` reaches 13.3 ms per token.
 
 ## License
 

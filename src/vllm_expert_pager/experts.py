@@ -329,6 +329,9 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             )
             cached_row = vram.no_cache  # read everything from the RAM tier
             base = layer * R
+            # Overlap the SSD read request and the gather of the experts that
+            # are in RAM in a single launch.
+            fetch = (ssd_todo, layer, store)
         else:
             # May not fit in the slots, so use the working buffer without
             # updating the table. Experts that hit are copied from the cache
@@ -349,7 +352,18 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 )
                 ssd_todo = torch.where(in_ram[need.clamp(min=0)] >= 0, -1, need)
                 base = 0
-        fetch_rows(ssd_todo, src_row, base, layer, store)
+            fetch = None
+        rows = (
+            [store.view[n] for n in PARAMS],
+            self._expert_pager_cache_rows[:2],
+            dst_rows[:2],
+            self._expert_pager_scale_rows,
+            dst_rows[2:],
+        )
+        if fetch is None:
+            fetch_rows(ssd_todo, src_row, base, layer, store)
+        else:
+            gather_rows(todo, dst_row, cached_row, src_row, base, *rows, fetch=fetch)
         if store.path is not None and not torch.cuda.is_current_stream_capturing():
             # In eager mode Python keeps queuing kernels for later layers, and
             # once the launch queue is full that launch blocks while holding the
@@ -360,17 +374,15 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             # so it needs none of this.
             torch.cuda.current_stream().synchronize()
 
+        # In decode only the experts read from SSD (those that were in RAM were
+        # copied by the launch above).
         gather_rows(
-            todo,
+            todo if fetch is None else ssd_todo,
             dst_row,
             cached_row,
             src_row,
             base,
-            [store.view[n] for n in PARAMS],
-            self._expert_pager_cache_rows[:2],
-            dst_rows[:2],
-            self._expert_pager_scale_rows,
-            dst_rows[2:],
+            *rows,
         )
 
         self._expert_pager_log()
@@ -421,6 +433,17 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             rh,
             rh + rm,
         )
+        # SSD-tier wait time. There is one store for every layer, so only the
+        # first layer reports it.
+        store = self._expert_pager_store
+        if self._expert_pager_layer == 0 and store.fetches:
+            logger.info(
+                "vllm-expert-pager ssd: %d fetches, %d reads, %.3f s, %.2f ms/fetch",
+                store.fetches,
+                store.reads,
+                store.io_seconds,
+                1e3 * store.io_seconds / store.fetches,
+            )
 
 
 def register() -> None:

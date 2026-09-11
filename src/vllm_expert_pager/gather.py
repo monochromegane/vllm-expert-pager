@@ -64,24 +64,23 @@ def _copy_scale(
 
 
 @triton.jit
-def _gather_rows_kernel(
-    todo_ptr,  # int64[K]  experts to copy. -1 is an empty entry
-    dst_row_ptr,  # int64[E]  expert -> destination row
-    cache_row_ptr,  # int64[E]  expert -> row on the cache slab; -1 reads from RAM
-    src_row_ptr,  # int64[E]  expert -> RAM-tier row (before adding base)
-    base,  # added to RAM-tier rows (first row of the layer)
-    src0_ptr, cache0_ptr, dst0_ptr, W0, C0,  # name 0 (w13). C0 is the chunk count
-    src1_ptr, cache1_ptr, dst1_ptr, W1,  # name 1 (w2)
-    scale0_ptr, sdst0_ptr, SW0,  # scales of name 0
-    scale1_ptr, sdst1_ptr, SW1,  # scales of name 1
+def _gather_one(
+    j, c,  # index into todo and chunk number
+    todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
+    src0_ptr, cache0_ptr, dst0_ptr, W0, C0,
+    src1_ptr, cache1_ptr, dst1_ptr, W1,
+    scale0_ptr, sdst0_ptr, SW0,
+    scale1_ptr, sdst1_ptr, SW1,
+    ssd_ptr, K,  # with SKIP_SSD: experts in this list are not copied (a separate launch copies them after the SSD read)
     BLOCK: tl.constexpr,
     SBLOCK: tl.constexpr,
+    SKIP_SSD: tl.constexpr,
 ):  # fmt: skip
-    j = tl.program_id(0)
-    c = tl.program_id(1)
-
     e = tl.load(todo_ptr + j)
     active = e >= 0
+    if SKIP_SSD:
+        for k in range(K):
+            active = active & (tl.load(ssd_ptr + k) != e)
     # Keep the index in range for empty entries; the value read is discarded.
     e = tl.maximum(e, 0)
     dst_row = tl.maximum(tl.load(dst_row_ptr + e), 0)
@@ -102,7 +101,62 @@ def _gather_rows_kernel(
 
 
 @triton.jit
-def _fetch_kernel(
+def _gather_rows_kernel(
+    todo_ptr,  # int64[K]  experts to copy. -1 is an empty entry
+    dst_row_ptr,  # int64[E]  expert -> destination row
+    cache_row_ptr,  # int64[E]  expert -> row on the cache slab; -1 reads from RAM
+    src_row_ptr,  # int64[E]  expert -> RAM-tier row (before adding base)
+    base,  # added to RAM-tier rows (first row of the layer)
+    src0_ptr, cache0_ptr, dst0_ptr, W0, C0,  # name 0 (w13). C0 is the chunk count
+    src1_ptr, cache1_ptr, dst1_ptr, W1,  # name 1 (w2)
+    scale0_ptr, sdst0_ptr, SW0,  # scales of name 0
+    scale1_ptr, sdst1_ptr, SW1,  # scales of name 1
+    ssd_ptr, K,  # with FETCH: experts to read from SSD (length K, padded with -1)
+    layer, seq_ptr, req_ptr, done_ptr,  # with FETCH: arguments of _fetch
+    BLOCK: tl.constexpr,
+    SBLOCK: tl.constexpr,
+    FETCH: tl.constexpr,
+    FBLOCK: tl.constexpr,
+):  # fmt: skip
+    j = tl.program_id(0)
+    c = tl.program_id(1)
+    if FETCH:
+        # Column 0 is reserved for the request. While program (0, 0) asks the
+        # host to read from SSD and waits, the programs of the other columns
+        # (other blocks) copy the experts that are in RAM, so the SSD wait and
+        # the PCIe gather overlap. Blocks are dispatched in order, so column 0
+        # runs first.
+        if c == 0:
+            if j == 0:
+                _fetch(
+                    ssd_ptr,
+                    src_row_ptr,
+                    K,
+                    base,
+                    layer,
+                    seq_ptr,
+                    req_ptr,
+                    done_ptr,
+                    FBLOCK,
+                )
+        else:
+            _gather_one(
+                j, c - 1, todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
+                src0_ptr, cache0_ptr, dst0_ptr, W0, C0, src1_ptr, cache1_ptr, dst1_ptr, W1,
+                scale0_ptr, sdst0_ptr, SW0, scale1_ptr, sdst1_ptr, SW1,
+                ssd_ptr, K, BLOCK, SBLOCK, True,
+            )  # fmt: skip
+    else:
+        _gather_one(
+            j, c, todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
+            src0_ptr, cache0_ptr, dst0_ptr, W0, C0, src1_ptr, cache1_ptr, dst1_ptr, W1,
+            scale0_ptr, sdst0_ptr, SW0, scale1_ptr, sdst1_ptr, SW1,
+            ssd_ptr, K, BLOCK, SBLOCK, False,
+        )  # fmt: skip
+
+
+@triton.jit
+def _fetch(
     todo_ptr,  # int64[K]  experts to read from SSD. -1 is an empty entry
     row_ptr,  # int64[E]  expert -> RAM-tier row (before adding base)
     K,
@@ -135,6 +189,13 @@ def _fetch_kernel(
             d = tl.load(done_ptr, volatile=True)
 
 
+@triton.jit
+def _fetch_kernel(
+    todo_ptr, row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, BLOCK: tl.constexpr
+):
+    _fetch(todo_ptr, row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, BLOCK)
+
+
 def as_rows(t: torch.Tensor) -> torch.Tensor:
     """View a tensor whose leading axis is the expert axis as ``(E, W)`` int32.
 
@@ -160,24 +221,43 @@ def gather_rows(
     dst: list[torch.Tensor],
     scale: list[torch.Tensor],
     scale_dst: list[torch.Tensor],
+    fetch: tuple[torch.Tensor, int, object] | None = None,
 ) -> None:
     """Copy the rows and scales of the experts in ``todo`` into ``dst`` / ``scale_dst``.
 
     Each list has two elements in name order (w13, w2), each a ``(*, W)`` int32
     view made by ``as_rows``. ``cache_row`` decides whether a row is read from
     ``cache`` or ``src``. Scales are always read from ``scale`` (every expert).
+
+    With ``fetch=(ssd_todo, layer, store)`` the same launch also asks the host
+    to read the experts in ``ssd_todo`` from SSD into the RAM tier and waits for
+    it (as ``fetch_rows`` does); meanwhile it copies the experts in ``todo``
+    that are not in ``ssd_todo`` (those in RAM). The experts in ``ssd_todo`` are
+    copied afterwards by a separate ``gather_rows(ssd_todo, ...)``.
     """
     W0, W1 = src[0].shape[1], src[1].shape[1]
     C0, C1 = triton.cdiv(W0, _BLOCK), triton.cdiv(W1, _BLOCK)
     SW0, SW1 = scale[0].shape[1], scale[1].shape[1]
-    grid = (todo.shape[0], C0 + C1)
+    K = todo.shape[0]
+    if fetch is None:
+        ssd, layer, store = todo, 0, None
+        seq = req = done = todo  # unused
+        grid, fblock = (K, C0 + C1), 16
+    else:
+        ssd, layer, store = fetch
+        if ssd.shape[0] != K:
+            raise ValueError(f"ssd_todo has {ssd.shape[0]} entries, todo has {K}")
+        seq, req, done = store.seq, store.req_view, store.done_view
+        grid, fblock = (K, C0 + C1 + 1), store.block
     _gather_rows_kernel[grid](
         todo, dst_row, cache_row, src_row, base,
         src[0], cache[0], dst[0], W0, C0,
         src[1], cache[1], dst[1], W1,
         scale[0], scale_dst[0], SW0,
         scale[1], scale_dst[1], SW1,
+        ssd, K, layer, seq, req, done,
         BLOCK=_BLOCK, SBLOCK=1 << (max(SW0, SW1) - 1).bit_length(),
+        FETCH=fetch is not None, FBLOCK=fblock,
     )  # fmt: skip
 
 
