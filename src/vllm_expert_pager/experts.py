@@ -421,6 +421,17 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             rh,
             rh + rm,
         )
+        # SSD-tier wait time. There is one store for every layer, so only the
+        # first layer reports it.
+        store = self._expert_pager_store
+        if self._expert_pager_layer == 0 and store.fetches:
+            logger.info(
+                "vllm-expert-pager ssd: %d fetches, %d reads, %.3f s, %.2f ms/fetch",
+                store.fetches,
+                store.reads,
+                store.io_seconds,
+                1e3 * store.io_seconds / store.fetches,
+            )
 
 
 def register() -> None:
