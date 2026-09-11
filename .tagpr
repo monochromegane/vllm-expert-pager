@@ -78,6 +78,6 @@
 #       Cannot be used with calendarVersioning.
 #
 [tagpr]
-	vPrefix = true
+	vPrefix = false
 	releaseBranch = main
-	versionFile = -
+	versionFile = pyproject.toml
