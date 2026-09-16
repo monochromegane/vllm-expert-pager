@@ -9,6 +9,8 @@ raw rows.
 """
 
 import os
+import threading
+import time
 
 import pytest
 import torch
@@ -248,6 +250,86 @@ def test_failed_read_releases_gpu(store):
         assert torch.equal(
             store.pinned[name][layer * R + 0], encoded(store, layer, 5, name)
         )
+
+
+def test_slow_host_makes_the_fetch_republish_the_request(store):
+    # When the host answers slowly, the waiting fetch publishes its request
+    # again. The request had arrived, so the re-publish does not change seq:
+    # nothing is read twice and nothing is lost.
+    dev = torch.device("cuda")
+    todo = torch.full((R,), -1, dtype=torch.int64, device=dev)
+    row = torch.zeros((E,), dtype=torch.int64, device=dev)
+    layer = 1
+    g = capture_fetch(store, todo, row, layer)
+
+    read = store._read
+
+    def slow(*args):
+        time.sleep(1.5)  # longer than the re-publish interval (0.5 to 1.2 s)
+        read(*args)
+
+    store._read = slow
+    todo.copy_(torch.tensor([4, -1, -1, -1], device=dev))
+    row[4] = 0
+    g.replay()
+    torch.cuda.synchronize()
+
+    assert store.failed is None, store.failed
+    assert int(store.req[store.retry_at]) >= 1
+    assert store.fetches == 1 and store.reads == 1
+    for name in ROW_BYTES:
+        assert torch.equal(
+            store.pinned[name][layer * R], encoded(store, layer, 4, name)
+        )
+
+
+def test_fetch_gives_up_when_the_host_never_answers(store):
+    # Simulates a handoff broken in both directions (the host never answers).
+    # The fetch stops waiting after a few seconds, so the server does not
+    # stall. The give-up count stays in pinned memory, and the host notices
+    # from the gap in seq at the next request.
+    dev = torch.device("cuda")
+    todo = torch.full((R,), -1, dtype=torch.int64, device=dev)
+    row = torch.zeros((E,), dtype=torch.int64, device=dev)
+    g = capture_fetch(store, todo, row, 1)
+
+    release = threading.Event()
+    store._read = lambda *args: release.wait(60)
+    todo.copy_(torch.tensor([4, -1, -1, -1], device=dev))
+    row[4] = 0
+    t0 = time.perf_counter()
+    g.replay()
+    torch.cuda.synchronize()
+    waited = time.perf_counter() - t0
+    release.set()
+
+    assert waited < 30, f"the fetch waited {waited:.1f} s"
+    assert int(store.req[store.giveup_at]) == 1
+    assert int(store.req[store.retry_at]) >= 1
+
+
+def test_serve_resends_done_when_the_fetch_is_still_spinning(store):
+    # When done did not reach the GPU. The GPU publishes its request again, so
+    # the host rewrites done even for a seq it has already served and releases
+    # the GPU. Reproduced by resetting done to 0.
+    dev = torch.device("cuda")
+    todo = torch.full((R,), -1, dtype=torch.int64, device=dev)
+    row = torch.zeros((E,), dtype=torch.int64, device=dev)
+    g = capture_fetch(store, todo, row, 1)
+    todo.copy_(torch.tensor([4, -1, -1, -1], device=dev))
+    row[4] = 0
+    g.replay()
+    torch.cuda.synchronize()
+
+    served = int(store.done[0])
+    assert served > 0
+    store.done[0] = 0
+    store.req[store.retry_at] += 1
+    for _ in range(200):
+        if int(store.done[0]) == served:
+            break
+        time.sleep(0.01)
+    assert int(store.done[0]) == served
 
 
 def test_large_pinned_is_not_rounded_to_pow2(tmp_path):

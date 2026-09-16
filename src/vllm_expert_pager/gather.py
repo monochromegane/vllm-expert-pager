@@ -32,6 +32,19 @@ from vllm_expert_pager import codec
 
 # Number of words one program copies (int32, so 16 KiB).
 _BLOCK = 4096
+# After this many idle spins waiting for done, the request is published again.
+# One spin is one volatile load across PCIe, measured at 514 spins/ms (GPU
+# otherwise idle) to 220 spins/ms (overlapping compute), so 0.5 to 1.2 s. It is
+# long so that a fetch that is merely slow (prefill reads hundreds of experts in
+# one request) is not re-published. Re-publishing never reads twice, but the
+# count marks that a handoff was lost. Kept as constexpr so the kernel sees a
+# constant.
+_SPIN_RETRY = tl.constexpr(1 << 18)
+# After this many re-publishes without done, stop waiting and move on (4 to
+# 10 s). When the handoff with the host is broken in both directions the
+# re-publish does not arrive either, and this keeps the server from stalling
+# forever. The rows of that layer stay stale, so one token's output is wrong.
+_SPIN_GIVEUP = tl.constexpr(8)
 
 
 @triton.jit
@@ -182,7 +195,7 @@ def _fetch(
     base,
     layer,
     seq_ptr,  # int64[1]  sequence number on the device
-    req_ptr,  # int64[2 + 2*BLOCK]  pinned. [seq, layer, expert[BLOCK], row[BLOCK]]
+    req_ptr,  # int64[4 + 2*BLOCK]  pinned. [seq, layer, expert[B], row[B], re-publishes, give-ups]
     done_ptr,  # int64[1]  pinned. The host writes the seq it has finished
     BLOCK: tl.constexpr,
 ):
@@ -204,8 +217,26 @@ def _fetch(
         tl.debug_barrier()
         tl.atomic_xchg(req_ptr, seq, sem="release", scope="sys")
         d = tl.load(done_ptr, volatile=True)
-        while d < seq:
+        n = 0
+        tries = 0
+        while (d < seq) & (tries < _SPIN_GIVEUP):
+            n += 1
+            if n >= _SPIN_RETRY:
+                n = 0
+                tries += 1
+                # Still waiting: publish the request again and advance the
+                # re-publish count. If the request had not arrived, the host
+                # serves this as a new one; if it was already served
+                # (seq == last), the host sees the count change and rewrites
+                # done. Either direction of a lost handoff recovers by itself.
+                tl.atomic_xchg(req_ptr, seq, sem="release", scope="sys")
+                tl.atomic_add(req_ptr + 2 + 2 * BLOCK, 1, sem="release", scope="sys")
             d = tl.load(done_ptr, volatile=True)
+        if d < seq:
+            # Even the re-publishes did not get through. Stop waiting here, or
+            # the server stays stuck. The rows of this layer stay stale, so
+            # count it for the host to notice.
+            tl.atomic_add(req_ptr + 3 + 2 * BLOCK, 1, sem="release", scope="sys")
 
 
 @triton.jit
