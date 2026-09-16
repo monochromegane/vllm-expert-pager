@@ -47,10 +47,12 @@ flowchart LR
 Each MoE layer has its own slots in VRAM and in pinned host RAM, both managed
 as LRU caches. An expert missing from a tier is brought in from the tier to its
 left: a host thread reads the paging file into RAM, and a Triton kernel copies
-RAM into VRAM. Every decision is made on the GPU, so the model keeps running
-under CUDA graphs. When a step needs more experts than there are slots (large
-batches, prefill), the layer falls back to a working buffer that holds every
-needed expert.
+RAM into VRAM. When the SSD tier is used, the RAM and SSD tiers hold the rows
+losslessly compressed (the fp8 exponents are Huffman coded per row) and the
+kernel expands them while copying. Every decision is made on the GPU, so the
+model keeps running under CUDA graphs. When a step needs more experts than
+there are slots (large batches, prefill), the layer falls back to a working
+buffer that holds every needed expert.
 
 ## Requirements
 
@@ -97,6 +99,8 @@ weights itself.
 | `VLLM_EXPERT_PAGER_CACHE_SLOTS` | `32` | VRAM cache slots per layer. One slot holds one expert. |
 | `VLLM_EXPERT_PAGER_RAM_SLOTS` | all experts | RAM-tier slots per layer. Must be at least `CACHE_SLOTS`. When smaller than the number of experts, the rest is paged in from SSD. |
 | `VLLM_EXPERT_PAGER_SSD_PATH` | none | Paging file. Required when `RAM_SLOTS` is smaller than the number of experts. It is written at startup and holds every expert of every layer. |
+| `VLLM_EXPERT_PAGER_COMPRESS` | `auto` | Whether to keep the RAM and SSD tiers losslessly compressed. `auto` compresses only when the SSD tier is used (`RAM_SLOTS` smaller than the number of experts); `on` and `off` force it. Not supported with the Marlin FP8 MoE backend. |
+| `VLLM_EXPERT_PAGER_PITCH` | `0.88` | Fixed length of a compressed row as a ratio of the raw row. If an expert does not fit, startup stops and reports the ratio needed. |
 | `VLLM_EXPERT_PAGER_LOG_INTERVAL` | `1000` | Log the cache hit rates every N eager forward calls per layer. `0` disables the log. |
 
 Memory use with `Qwen/Qwen3.6-35B-A3B-FP8` (40 MoE layers, 256 experts, 3 MiB
@@ -105,7 +109,8 @@ per expert):
 | Setting | VRAM for experts | Pinned RAM | SSD |
 |---|---|---|---|
 | `CACHE_SLOTS=32`, `RAM_SLOTS=256` | about 4.6 GiB | 30.75 GiB | not used |
-| `CACHE_SLOTS=32`, `RAM_SLOTS=128` | about 4.6 GiB | 15.75 GiB | 30 GiB |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=128` | about 4.6 GiB | 13.9 GiB | 26.4 GiB |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=128`, `COMPRESS=off` | about 4.6 GiB | 15.75 GiB | 30 GiB |
 
 ## Results
 
@@ -115,7 +120,9 @@ Measured on an RTX 4090 (24 GB) under WSL2 with vLLM 0.29.0 and
 `vllm bench serve` with one concurrent request, 1024 input and 256 output
 tokens, 4 prompts; each configuration was run twice and the second run is
 reported. TPOT is the time per output token, TTFT the time to first token.
-The baseline is vLLM's own `--cpu-offload-gb`.
+The baseline is vLLM's own `--cpu-offload-gb`. The measurements predate the
+compression of the RAM and SSD tiers, so the `RAM_SLOTS=128` row corresponds
+to `VLLM_EXPERT_PAGER_COMPRESS=off`.
 
 | Configuration | VRAM for experts | Pinned RAM | SSD | TPOT | TTFT | Output tok/s |
 |---|---|---|---|---|---|---|

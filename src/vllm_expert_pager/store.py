@@ -1,4 +1,4 @@
-"""RAM and SSD tiers for expert weights.
+"""RAM and SSD tiers for expert weights. Both hold the rows compressed (codec.py).
 
 The RAM tier is an array of rows in pinned memory. The GPU reads it through a
 UVA view and the host writes it through a numpy view. Each layer has R rows,
@@ -6,10 +6,20 @@ followed by E rows for prefill (shared by all layers); row numbers are unique
 across layers so the gather kernel has a single source.
 
 The SSD tier is a paging file of fixed-length records (the w13 row followed by
-the w2 row) in [layer][expert] order. weight_loader writes it at load time; at
-inference a host thread serves requests from the GPU with O_DIRECT preadv, and
-the experts of one layer are read concurrently by a thread pool. O_DIRECT keeps
-the page cache from holding a second copy of the RAM tier.
+the w2 row, each compressed and rounded up to its pitch) in [layer][expert]
+order. weight_loader writes it at load time; at inference a host thread serves
+requests from the GPU with O_DIRECT preadv, and the experts of one layer are
+read concurrently by a thread pool. O_DIRECT keeps the page cache from holding
+a second copy of the RAM tier. The host does not expand the rows; the GPU does,
+after copying them into VRAM.
+
+The Huffman LUT differs per row but is only 512 B, so it is not part of the
+record. It lives in a VRAM-resident table like the scales (``lut``, indexed by
+layer and expert). When gather also expands, it copies per group, and a LUT per
+group would add 3.6% to the PCIe traffic (codec.py).
+
+With ``compress=False`` the rows are stored raw. When every expert fits in RAM
+there are no SSD reads, and the expansion costs more than the 12% saved on PCIe.
 
 The GPU and host communicate through two words in pinned memory. The GPU writes
 a request (layer, and the list of experts and rows) and advances req[0] (seq);
@@ -28,6 +38,8 @@ from concurrent.futures import ThreadPoolExecutor, wait
 import torch
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+from vllm_expert_pager import codec
 
 logger = init_logger(f"vllm.{__name__}")
 
@@ -75,6 +87,8 @@ class Store:
         num_experts: int,
         ram_slots: int,
         row_bytes: dict[str, int],
+        compress: bool,
+        pitch_ratio: float,
         path: str | None,
         device: torch.device,
     ) -> None:
@@ -89,20 +103,30 @@ class Store:
                 "VLLM_EXPERT_PAGER_RAM_SLOTS < num_experts"
             )
         for name, nbytes in row_bytes.items():
-            if nbytes % _ALIGN:
+            unit = codec.GROUP if compress else _ALIGN
+            if nbytes % unit:
                 raise ValueError(
-                    f"{name}: row of {nbytes} B is not a multiple of {_ALIGN}"
+                    f"{name}: row of {nbytes} B is not a multiple of {unit}"
                 )
 
         self.num_layers, self.num_experts, self.ram_slots = L, E, R
         self.layers = 0
+        self.device = device
+        self.compress = compress
         self.names = list(row_bytes)
-        self.record_bytes = sum(row_bytes.values())
+        # Raw (expanded) rows, and the fixed length of the rows in the tiers.
+        # The pitch is a multiple of _ALIGN, so it satisfies O_DIRECT.
+        self.row_bytes = dict(row_bytes)
+        self.pitch = {
+            name: codec.pitch_of(nbytes, pitch_ratio, _ALIGN) if compress else nbytes
+            for name, nbytes in row_bytes.items()
+        }
+        self.record_bytes = sum(self.pitch.values())
         self.offset = {}
         pos = 0
         for name in self.names:
             self.offset[name] = pos
-            pos += row_bytes[name]
+            pos += self.pitch[name]
 
         # Rows [0, L*R) are the RAM tier (slot s of layer l is l*R + s); rows
         # [L*R, L*R+E) are the shared working rows.
@@ -111,15 +135,24 @@ class Store:
             f"pinned_max_round_threshold_mb:{_PINNED_ROUND_LIMIT_MB}"
         )
         logger.info(
-            "vllm-expert-pager: RAM tier %d rows x %d B = %.2f GiB pinned",
+            "vllm-expert-pager: RAM tier %d rows x %d B (%s) = %.2f GiB pinned",
             L * R + E,
             self.record_bytes,
+            f"compressed from {sum(row_bytes.values())} B" if compress else "raw",
             (L * R + E) * self.record_bytes / 2**30,
         )
         self.pinned = {
             name: _pinned_aligned(L * R + E, nbytes // 4)
-            for name, nbytes in row_bytes.items()
+            for name, nbytes in self.pitch.items()
         }
+        # Per-row Huffman LUTs: lut[l, e, i] belongs to expert e of layer l,
+        # name i. Without compression they are never read, so allocate just
+        # enough to have a pointer to pass to the kernel.
+        self.lut = torch.zeros(
+            (L if compress else 1, E, len(self.names), codec.LUT_BYTES),
+            dtype=torch.uint8,
+            device=device,
+        )
         self.view = {
             n: get_accelerator_view_from_cpu_tensor(t) for n, t in self.pinned.items()
         }
@@ -171,6 +204,10 @@ class Store:
             target=self._serve, daemon=True, name="vllm-expert-pager-ssd"
         ).start()
 
+    def layer_lut(self, layer: int) -> torch.Tensor:
+        """The LUTs ``(E, names, 512)`` of layer ``layer``. Unused without compression."""
+        return self.lut[layer if self.compress else 0]
+
     def add_layer(self) -> int:
         """Hand out a layer number. Layers register in construction order."""
         if self.layers >= self.num_layers:
@@ -183,13 +220,22 @@ class Store:
     # ---- Load time ----
 
     def write(self, layer: int, expert: int, name: str, row: torch.Tensor) -> None:
-        """Put one expert's weights in the paging file and, if e < R, in RAM-tier slot e."""
-        words = row.contiguous().view(torch.int32).reshape(-1)
-        if words.numel() != self.pinned[name].shape[1]:
+        """Put one expert's weights (compressed if compress) in the paging file and the RAM tier.
+
+        The RAM tier gets them only when e < R (slot e).
+        """
+        raw = row.contiguous().view(torch.uint8).reshape(-1)
+        if raw.numel() != self.row_bytes[name]:
             raise ValueError(
-                f"{name}: expert {expert} of layer {layer} has {words.numel()} words, "
-                f"expected {self.pinned[name].shape[1]}"
+                f"{name}: expert {expert} of layer {layer} has {raw.numel()} B, "
+                f"expected {self.row_bytes[name]}"
             )
+        if self.compress:
+            record, lut = codec.encode(raw.to(self.device), self.pitch[name])
+            self.lut[layer, expert, self.names.index(name)] = lut
+            words = record.view(torch.int32).cpu()
+        else:
+            words = raw.view(torch.int32)
         if expert < self.ram_slots:
             self.pinned[name][layer * self.ram_slots + expert].copy_(words)
         if self.fd_w is not None:

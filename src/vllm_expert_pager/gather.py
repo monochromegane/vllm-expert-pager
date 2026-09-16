@@ -1,11 +1,23 @@
-"""Triton kernels that copy one expert into a slab and request reads from the host.
+"""Triton kernels that copy and expand one expert and request reads from the host.
 
 The source is either the RAM tier (pinned memory seen from the device as a UVA
-view) or the cache slab; the destination is the cache slab or the working
-buffer. Scales (VRAM resident, in expert order) are copied to the same slot,
-because the MoE kernel indexes weights and scales with the same slot number.
-Which experts to copy is passed as index tensors on the device, so the host
-needs to know nothing and the kernels run under CUDA graphs.
+view, compressed) or the cache slab (raw). Scales (VRAM resident, in expert
+order) are copied to the same slot, because the MoE kernel indexes weights and
+scales with the same slot number. Which experts to copy is passed as index
+tensors on the device, so the host needs to know nothing and the kernels run
+under CUDA graphs.
+
+There are two paths:
+
+``fetch_decode_rows``  Decode (K <= S) with compression. While the host is asked
+  to read from SSD and the kernel waits, it copies the groups of the experts
+  that are in RAM into staging and expands them straight into the slab. Both
+  the copy and the expansion hide under the SSD wait.
+``gather_rows``  Only copies rows. With compression, RAM-tier rows go to staging
+  (``codec.decode_rows`` expands them in a separate launch); without it they go
+  straight into the slab. Raw rows from the cache slab always go to dst. With
+  ``fetch`` it copies while waiting for the SSD read (decode without
+  compression).
 
 The SMs copy with loads and stores instead of ``cudaMemcpyAsync``. A memcpy has
 fixed addresses, so putting one in a graph would mean "copy the same expert
@@ -16,6 +28,8 @@ import torch
 import triton
 import triton.language as tl
 
+from vllm_expert_pager import codec
+
 # Number of words one program copies (int32, so 16 KiB).
 _BLOCK = 4096
 
@@ -23,28 +37,36 @@ _BLOCK = 4096
 @triton.jit
 def _copy_row(
     chunk,
-    W,  # words per row
-    src_ptr,  # int32[*, W]  RAM tier (UVA view)
-    cache_ptr,  # int32[S, W]  cache slab
-    dst_ptr,  # int32[*, W]  destination
+    W,  # words per raw row
+    P,  # words per compressed row (pitch)
+    src_ptr,  # int32[*, P]  RAM tier (UVA view, compressed)
+    cache_ptr,  # int32[S, W]  cache slab (raw)
+    dst_ptr,  # int32[*, W]  raw destination
+    stg_ptr,  # int32[*, P]  compressed destination (row j, the index into todo)
     src_row,
     cache_row,
     dst_row,
+    j,
     active,
     BLOCK: tl.constexpr,
+    COMPRESS: tl.constexpr,
 ):
     offs = chunk * BLOCK + tl.arange(0, BLOCK)
-    in_row = active & (offs < W)
-    from_cache = in_row & (cache_row >= 0)
-    from_src = in_row & (cache_row < 0)
+    from_cache = active & (cache_row >= 0) & (offs < W)
+    from_src = active & (cache_row < 0) & (offs < P)
 
-    # A masked-off load does not touch memory, so issuing both reads only one.
-    x_cache = tl.load(
+    # A masked-off load does not touch memory, so issuing both runs only one.
+    x = tl.load(
         cache_ptr + tl.maximum(cache_row, 0) * W + offs, mask=from_cache, other=0
     )
-    x_src = tl.load(src_ptr + src_row * W + offs, mask=from_src, other=0)
-    x = tl.where(cache_row >= 0, x_cache, x_src)
-    tl.store(dst_ptr + dst_row * W + offs, x, mask=in_row)
+    tl.store(dst_ptr + dst_row * W + offs, x, mask=from_cache)
+    x = tl.load(src_ptr + src_row * P + offs, mask=from_src, other=0)
+    if COMPRESS:
+        tl.store(stg_ptr + j * P + offs, x, mask=from_src)
+    else:
+        # A raw row is already in the form the kernel reads, so copy it straight
+        # into the slab (P == W).
+        tl.store(dst_ptr + dst_row * P + offs, x, mask=from_src)
 
 
 @triton.jit
@@ -67,13 +89,14 @@ def _copy_scale(
 def _gather_one(
     j, c,  # index into todo and chunk number
     todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
-    src0_ptr, cache0_ptr, dst0_ptr, W0, C0,
-    src1_ptr, cache1_ptr, dst1_ptr, W1,
+    src0_ptr, cache0_ptr, dst0_ptr, stg0_ptr, W0, P0, C0,
+    src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, W1, P1,
     scale0_ptr, sdst0_ptr, SW0,
     scale1_ptr, sdst1_ptr, SW1,
     ssd_ptr, K,  # with SKIP_SSD: experts in this list are not copied (a separate launch copies them after the SSD read)
     BLOCK: tl.constexpr,
     SBLOCK: tl.constexpr,
+    COMPRESS: tl.constexpr,
     SKIP_SSD: tl.constexpr,
 ):  # fmt: skip
     e = tl.load(todo_ptr + j)
@@ -86,16 +109,17 @@ def _gather_one(
     dst_row = tl.maximum(tl.load(dst_row_ptr + e), 0)
     cache_row = tl.load(cache_row_ptr + e)
     src_row = tl.load(src_row_ptr + e) + base
+    j = j.to(tl.int64)
 
     # Weights are copied per name in chunks of BLOCK words. The program for the
     # first chunk of each name copies that name's whole scale row (it only needs
     # updating when the slot's contents change).
     if c < C0:
-        _copy_row(c, W0, src0_ptr, cache0_ptr, dst0_ptr, src_row, cache_row, dst_row, active, BLOCK)  # fmt: skip
+        _copy_row(c, W0, P0, src0_ptr, cache0_ptr, dst0_ptr, stg0_ptr, src_row, cache_row, dst_row, j, active, BLOCK, COMPRESS)  # fmt: skip
         if c == 0:
             _copy_scale(SW0, scale0_ptr, sdst0_ptr, e, dst_row, active, SBLOCK)
     else:
-        _copy_row(c - C0, W1, src1_ptr, cache1_ptr, dst1_ptr, src_row, cache_row, dst_row, active, BLOCK)  # fmt: skip
+        _copy_row(c - C0, W1, P1, src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, src_row, cache_row, dst_row, j, active, BLOCK, COMPRESS)  # fmt: skip
         if c == C0:
             _copy_scale(SW1, scale1_ptr, sdst1_ptr, e, dst_row, active, SBLOCK)
 
@@ -107,14 +131,15 @@ def _gather_rows_kernel(
     cache_row_ptr,  # int64[E]  expert -> row on the cache slab; -1 reads from RAM
     src_row_ptr,  # int64[E]  expert -> RAM-tier row (before adding base)
     base,  # added to RAM-tier rows (first row of the layer)
-    src0_ptr, cache0_ptr, dst0_ptr, W0, C0,  # name 0 (w13). C0 is the chunk count
-    src1_ptr, cache1_ptr, dst1_ptr, W1,  # name 1 (w2)
+    src0_ptr, cache0_ptr, dst0_ptr, stg0_ptr, W0, P0, C0,  # name 0 (w13). C0 is the chunk count
+    src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, W1, P1,  # name 1 (w2)
     scale0_ptr, sdst0_ptr, SW0,  # scales of name 0
     scale1_ptr, sdst1_ptr, SW1,  # scales of name 1
     ssd_ptr, K,  # with FETCH: experts to read from SSD (length K, padded with -1)
     layer, seq_ptr, req_ptr, done_ptr,  # with FETCH: arguments of _fetch
     BLOCK: tl.constexpr,
     SBLOCK: tl.constexpr,
+    COMPRESS: tl.constexpr,
     FETCH: tl.constexpr,
     FBLOCK: tl.constexpr,
 ):  # fmt: skip
@@ -128,30 +153,24 @@ def _gather_rows_kernel(
         # runs first.
         if c == 0:
             if j == 0:
-                _fetch(
-                    ssd_ptr,
-                    src_row_ptr,
-                    K,
-                    base,
-                    layer,
-                    seq_ptr,
-                    req_ptr,
-                    done_ptr,
-                    FBLOCK,
-                )
+                _fetch(ssd_ptr, src_row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, FBLOCK)  # fmt: skip
         else:
             _gather_one(
-                j, c - 1, todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
-                src0_ptr, cache0_ptr, dst0_ptr, W0, C0, src1_ptr, cache1_ptr, dst1_ptr, W1,
+                j, c - 1,
+                todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
+                src0_ptr, cache0_ptr, dst0_ptr, stg0_ptr, W0, P0, C0,
+                src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, W1, P1,
                 scale0_ptr, sdst0_ptr, SW0, scale1_ptr, sdst1_ptr, SW1,
-                ssd_ptr, K, BLOCK, SBLOCK, True,
+                ssd_ptr, K, BLOCK, SBLOCK, COMPRESS, True,
             )  # fmt: skip
     else:
         _gather_one(
-            j, c, todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
-            src0_ptr, cache0_ptr, dst0_ptr, W0, C0, src1_ptr, cache1_ptr, dst1_ptr, W1,
+            j, c,
+            todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
+            src0_ptr, cache0_ptr, dst0_ptr, stg0_ptr, W0, P0, C0,
+            src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, W1, P1,
             scale0_ptr, sdst0_ptr, SW0, scale1_ptr, sdst1_ptr, SW1,
-            ssd_ptr, K, BLOCK, SBLOCK, False,
+            ssd_ptr, K, BLOCK, SBLOCK, COMPRESS, False,
         )  # fmt: skip
 
 
@@ -219,24 +238,41 @@ def gather_rows(
     src: list[torch.Tensor],
     cache: list[torch.Tensor],
     dst: list[torch.Tensor],
+    stg: list[torch.Tensor] | None,
     scale: list[torch.Tensor],
     scale_dst: list[torch.Tensor],
     fetch: tuple[torch.Tensor, int, object] | None = None,
 ) -> None:
-    """Copy the rows and scales of the experts in ``todo`` into ``dst`` / ``scale_dst``.
+    """Copy the rows and scales of the experts in ``todo``.
 
-    Each list has two elements in name order (w13, w2), each a ``(*, W)`` int32
-    view made by ``as_rows``. ``cache_row`` decides whether a row is read from
-    ``cache`` or ``src``. Scales are always read from ``scale`` (every expert).
+    Each list has two elements in name order (w13, w2), each an int32 view made
+    by ``as_rows``. Experts with ``cache_row[e] >= 0`` are copied from the cache
+    slab ``cache`` (raw, ``(S, W)``) to row ``dst_row[e]`` of ``dst``
+    (``(*, W)``). The others are copied from the RAM tier ``src``: with
+    compression to row j (the index into todo) of the staging ``stg``
+    (``(*, P)``), without it (``stg`` is None) to row ``dst_row[e]`` of ``dst``.
+    Compressed rows are expanded by ``codec.decode_rows``. Scales are always
+    copied from ``scale`` (every expert) to row ``dst_row[e]`` of ``scale_dst``.
 
     With ``fetch=(ssd_todo, layer, store)`` the same launch also asks the host
     to read the experts in ``ssd_todo`` from SSD into the RAM tier and waits for
     it (as ``fetch_rows`` does); meanwhile it copies the experts in ``todo``
     that are not in ``ssd_todo`` (those in RAM). The experts in ``ssd_todo`` are
-    copied afterwards by a separate ``gather_rows(ssd_todo, ...)``.
+    copied afterwards by a separate ``gather_rows(ssd_todo, ...)``. Decode with
+    compression uses ``fetch_decode_rows`` instead, which hides the expansion
+    under the SSD wait as well.
     """
-    W0, W1 = src[0].shape[1], src[1].shape[1]
-    C0, C1 = triton.cdiv(W0, _BLOCK), triton.cdiv(W1, _BLOCK)
+    W0, W1 = dst[0].shape[1], dst[1].shape[1]
+    P0, P1 = src[0].shape[1], src[1].shape[1]
+    compress = stg is not None
+    if compress:
+        if (P0, P1) != (stg[0].shape[1], stg[1].shape[1]):
+            raise ValueError("staging rows must have the RAM tier's pitch")
+    else:
+        if (P0, P1) != (W0, W1):
+            raise ValueError("uncompressed RAM rows must have the slab's row size")
+        stg = dst  # unused
+    C0, C1 = triton.cdiv(max(W0, P0), _BLOCK), triton.cdiv(max(W1, P1), _BLOCK)
     SW0, SW1 = scale[0].shape[1], scale[1].shape[1]
     K = todo.shape[0]
     if fetch is None:
@@ -251,13 +287,128 @@ def gather_rows(
         grid, fblock = (K, C0 + C1 + 1), store.block
     _gather_rows_kernel[grid](
         todo, dst_row, cache_row, src_row, base,
-        src[0], cache[0], dst[0], W0, C0,
-        src[1], cache[1], dst[1], W1,
+        src[0], cache[0], dst[0], stg[0], W0, P0, C0,
+        src[1], cache[1], dst[1], stg[1], W1, P1,
         scale[0], scale_dst[0], SW0,
         scale[1], scale_dst[1], SW1,
         ssd, K, layer, seq, req, done,
         BLOCK=_BLOCK, SBLOCK=1 << (max(SW0, SW1) - 1).bit_length(),
-        FETCH=fetch is not None, FBLOCK=fblock,
+        COMPRESS=compress, FETCH=fetch is not None, FBLOCK=fblock,
+    )  # fmt: skip
+
+
+@triton.jit
+def _fetch_decode_kernel(
+    todo_ptr,  # int64[K]  experts to copy. -1 is an empty entry
+    dst_row_ptr,  # int64[E]  expert -> slab row
+    src_row_ptr,  # int64[E]  expert -> RAM-tier row (before adding base)
+    base,  # added to RAM-tier rows (first row of the layer)
+    lut_ptr,  # uint8[E, 2, 512]  this layer's LUTs
+    src0_ptr, stg0_ptr, dst0_ptr, P0, N0, G0,  # name 0 (w13). P0 is the pitch in words, N0 the raw row in bytes
+    src1_ptr, stg1_ptr, dst1_ptr, P1, N1, G1,  # name 1 (w2)
+    scale0_ptr, sdst0_ptr, SW0,
+    scale1_ptr, sdst1_ptr, SW1,
+    ssd_ptr, K,  # experts to read from SSD (length K, padded with -1)
+    layer, seq_ptr, req_ptr, done_ptr,  # arguments of _fetch
+    CHUNK,
+    SBLOCK: tl.constexpr,
+    FBLOCK: tl.constexpr,
+    LANES: tl.constexpr,
+    LUT_BYTES: tl.constexpr,
+    LIMIT: tl.constexpr,
+    COPY_BLOCK: tl.constexpr,
+):  # fmt: skip
+    j = tl.program_id(0)
+    col = tl.program_id(1)
+    # Column 0 is reserved for the request. While program (0, 0) asks the host
+    # to read from SSD and waits, the programs of the other columns (other
+    # blocks) copy and expand the experts that are in RAM, so the SSD wait, the
+    # PCIe gather and the expansion overlap. Blocks are dispatched in order, so
+    # column 0 runs first.
+    if col == 0:
+        # Only program 0 of column 0 asks the host and waits. The others do
+        # nothing.
+        if j == 0:
+            _fetch(ssd_ptr, src_row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, FBLOCK)  # fmt: skip
+    else:
+        e = tl.load(todo_ptr + j)
+        # Programs for empty entries exit here (todo has a fixed length K and
+        # may be mostly empty).
+        if e >= 0:
+            # Experts read from SSD are not in RAM yet. A separate launch copies
+            # and expands them after the read.
+            active = e >= 0
+            for k in range(K):
+                active = active & (tl.load(ssd_ptr + k) != e)
+            if active:
+                g = col - 1
+                jj = j.to(tl.int64)
+                dst_row = tl.maximum(tl.load(dst_row_ptr + e), 0)
+                src_row = tl.load(src_row_ptr + e) + base
+                lut = lut_ptr + e * (2 * LUT_BYTES)
+                if g < G0:
+                    codec.copy_and_decode_group(
+                        lut, src0_ptr + src_row * P0, stg0_ptr + jj * P0,
+                        dst0_ptr + dst_row * (N0 // 8), G0, g, CHUNK,
+                        LANES, LUT_BYTES, LIMIT, COPY_BLOCK,
+                    )  # fmt: skip
+                    if g == 0:
+                        _copy_scale(SW0, scale0_ptr, sdst0_ptr, e, dst_row, True, SBLOCK)  # fmt: skip
+                else:
+                    codec.copy_and_decode_group(
+                        lut + LUT_BYTES, src1_ptr + src_row * P1, stg1_ptr + jj * P1,
+                        dst1_ptr + dst_row * (N1 // 8), G1, g - G0, CHUNK,
+                        LANES, LUT_BYTES, LIMIT, COPY_BLOCK,
+                    )  # fmt: skip
+                    if g == G0:
+                        _copy_scale(SW1, scale1_ptr, sdst1_ptr, e, dst_row, True, SBLOCK)  # fmt: skip
+
+
+def fetch_decode_rows(
+    todo: torch.Tensor,
+    ssd_todo: torch.Tensor,
+    dst_row: torch.Tensor,
+    src_row: torch.Tensor,
+    base: int,
+    layer: int,
+    store,
+    src: list[torch.Tensor],
+    dst: list[torch.Tensor],
+    stg: list[torch.Tensor],
+    scale: list[torch.Tensor],
+    scale_dst: list[torch.Tensor],
+    lut: torch.Tensor,
+    chunk: int = codec.CHUNK,
+) -> None:
+    """Expand the rest of ``todo`` from the RAM tier into the slab while the host reads ``ssd_todo``.
+
+    ``src`` are the RAM tier's ``(*, P)`` int32 views, ``stg`` the staging's
+    ``(*, P)`` uint8, ``dst`` the slab's ``(*, N)`` uint8, and ``lut`` this
+    layer's ``(E, 2, 512)`` uint8. Every expert in ``todo`` is read from the RAM
+    tier (in the decode path only VRAM misses are listed). The experts in
+    ``ssd_todo`` are copied afterwards with ``gather_rows`` and
+    ``codec.decode_rows``.
+    """
+    if ssd_todo.shape[0] != todo.shape[0]:
+        raise ValueError("ssd_todo and todo must have the same length")
+    P0, P1 = src[0].shape[1], src[1].shape[1]
+    if (4 * P0, 4 * P1) != (stg[0].shape[1], stg[1].shape[1]):
+        raise ValueError("staging rows must have the RAM tier's pitch")
+    N0, N1 = dst[0].shape[1], dst[1].shape[1]
+    G0, G1 = codec.groups(N0, chunk), codec.groups(N1, chunk)
+    SW0, SW1 = scale[0].shape[1], scale[1].shape[1]
+    _fetch_decode_kernel[(todo.shape[0], 1 + G0 + G1)](
+        todo, dst_row, src_row, base, lut,
+        src[0], stg[0].view(torch.int32), dst[0].view(torch.int64), P0, N0, G0,
+        src[1], stg[1].view(torch.int32), dst[1].view(torch.int64), P1, N1, G1,
+        scale[0], scale_dst[0], SW0,
+        scale[1], scale_dst[1], SW1,
+        ssd_todo, todo.shape[0],
+        layer, store.seq, store.req_view, store.done_view,
+        chunk,
+        SBLOCK=1 << (max(SW0, SW1) - 1).bit_length(), FBLOCK=store.block,
+        LANES=codec.LANES, LUT_BYTES=codec.LUT_BYTES, LIMIT=codec.LIMIT,
+        COPY_BLOCK=codec.COPY_BLOCK, num_warps=codec.LANES // 32,
     )  # fmt: skip
 
 
