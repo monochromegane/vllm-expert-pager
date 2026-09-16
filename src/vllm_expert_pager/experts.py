@@ -504,11 +504,15 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         store = self._expert_pager_store
         if self._expert_pager_layer == 0 and store.fetches:
             logger.info(
-                "vllm-expert-pager ssd: %d fetches, %d reads, %.3f s, %.2f ms/fetch",
+                "vllm-expert-pager ssd: %d fetches, %d reads, %.3f s, %.2f ms/fetch, "
+                "%d re-publishes, %d give-ups, %d missed",
                 store.fetches,
                 store.reads,
                 store.io_seconds,
                 1e3 * store.io_seconds / store.fetches,
+                int(store.req[store.retry_at]),
+                int(store.req[store.giveup_at]),
+                store.missed,
             )
 
 

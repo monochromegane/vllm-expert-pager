@@ -158,11 +158,16 @@ class Store:
         }
         self._np = {n: t.numpy() for n, t in self.pinned.items()}
 
-        # req = [seq, layer, expert[B], row[B]]. B is the fetch kernel's BLOCK
-        # (the power of two >= E).
+        # req = [seq, layer, expert[B], row[B], re-publishes, give-ups]. B is
+        # the fetch kernel's BLOCK (the power of two >= E). The last two words
+        # advance when a spinning fetch gives up waiting and publishes its
+        # request again, and when even that does not get through and it stops
+        # waiting.
         self.block = 1 << (E - 1).bit_length()
+        self.retry_at = 2 + 2 * self.block
+        self.giveup_at = 3 + 2 * self.block
         self.req = torch.zeros(
-            (2 + 2 * self.block,), dtype=torch.int64, device="cpu", pin_memory=True
+            (self.giveup_at + 1,), dtype=torch.int64, device="cpu", pin_memory=True
         )
         self.done = torch.zeros((1,), dtype=torch.int64, device="cpu", pin_memory=True)
         self.req_view = get_accelerator_view_from_cpu_tensor(self.req)
@@ -171,10 +176,13 @@ class Store:
         # Traceback of an I/O failure on the host thread. forward checks it and
         # raises.
         self.failed: str | None = None
-        # Statistics. fetches counts the requests, reads the experts read, and
-        # io_seconds the total time from seeing a request to writing done. Only
-        # the host thread writes them.
-        self.fetches = self.reads = 0
+        # Statistics. fetches counts the requests, reads the experts read,
+        # io_seconds the total time from seeing a request to writing done,
+        # retries the times the GPU published a request again, and missed the
+        # requests that never arrived before the GPU moved on to the next one
+        # (either being non-zero means a handoff was lost). Only the host thread
+        # writes them.
+        self.fetches = self.reads = self.retries = self.missed = 0
         self.io_seconds = 0.0
 
         self.path = path if R < E else None
@@ -249,11 +257,56 @@ class Store:
     def _serve(self) -> None:
         req, done, B = self.req.numpy(), self.done.numpy(), self.block
         last = 0
+        resent = time.perf_counter()
         while True:
-            seq = int(req[0])
+            seq, retries = int(req[0]), int(req[self.retry_at])
             if seq == last:
+                # While nothing arrives, rewrite the served done now and then.
+                # Even when the GPU's writes are not getting through (so the
+                # re-publish count is not visible either), a fetch that merely
+                # missed done gets out this way. The value does not change, so
+                # it is harmless.
+                now = time.perf_counter()
+                if now - resent > 0.5:
+                    resent = now
+                    done[0] = last
+                if retries != self.retries:
+                    # A fetch is still waiting for a seq that was served: done
+                    # did not reach it. Rewrite it to release the fetch.
+                    self.retries = retries
+                    done[0] = last
+                    logger.warning(
+                        "vllm-expert-pager: fetch %d is still spinning after done "
+                        "was written; re-sent it (%d re-publishes so far)",
+                        last,
+                        retries,
+                    )
                 time.sleep(50e-6)
                 continue
+            if retries != self.retries:
+                # The request arrived through a re-publish; the first write was
+                # not visible to the host.
+                self.retries = retries
+                logger.warning(
+                    "vllm-expert-pager: request %d arrived only after a re-publish "
+                    "(%d re-publishes so far)",
+                    seq,
+                    retries,
+                )
+            if seq > last + 1:
+                # Requests were given up by the GPU without ever being seen. The
+                # rows of those layers are stale, so the previous token's output
+                # is wrong.
+                self.missed += seq - last - 1
+                logger.error(
+                    "vllm-expert-pager: %d request(s) before %d never reached the "
+                    "host (%d missed so far, %d give-ups); the rows of those layers "
+                    "are stale and the affected tokens are wrong",
+                    seq - last - 1,
+                    seq,
+                    self.missed,
+                    int(req[self.giveup_at]),
+                )
             t0 = time.perf_counter()
             layer = int(req[1])
             pairs = [
@@ -283,6 +336,10 @@ class Store:
             self.fetches += 1
             self.reads += len(pairs)
             self.io_seconds += time.perf_counter() - t0
+            # Re-publishes during a read that took longer than the re-publish
+            # interval are not lost handoffs, so absorb them (only those after
+            # done is written mean "done did not arrive").
+            self.retries = int(req[self.retry_at])
             # Release the GPU even on failure. The next forward that runs Python
             # sees failed and stops.
             done[0] = seq
