@@ -55,13 +55,20 @@ class ExpertTable:
 
     # ---- Shared ----
 
+    def _ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Flatten ``topk_ids`` to int64, sending negative ids (vLLM's -1 for invalid entries) to the sink E."""
+        ids = topk_ids.reshape(-1).to(torch.int64)
+        return torch.where(ids >= 0, ids, self.num_experts)
+
     def need_mask(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """Return the set of experts needed in this step as a bool mask."""
-        need = torch.zeros((self.num_experts,), dtype=torch.bool, device=self.device)
+        need = torch.zeros(
+            (self.num_experts + 1,), dtype=torch.bool, device=self.device
+        )
         # Writing the same value to duplicate indices, so the order does not
         # matter.
-        need.index_fill_(0, topk_ids.reshape(-1).to(torch.int64), True)
-        return need
+        need.index_fill_(0, self._ids(topk_ids), True)
+        return need[: self.num_experts]
 
     # ---- Cache path ----
 
@@ -144,6 +151,80 @@ class ExpertTable:
         need = self.need_mask(topk_ids)
         slot = torch.cumsum(need.to(torch.int64), 0) - 1
         expert_map = torch.where(need, slot, -1)
-        todo = torch.full((K + 1,), -1, dtype=torch.int64, device=self.device)
-        todo.index_put_((torch.where(need, slot, K),), self.experts)
-        return expert_map, slot, self.slot_of[:E], todo[:K]
+        return expert_map, slot, self.slot_of[:E], self.pack(need)[:K]
+
+    def pack(self, mask: torch.Tensor) -> torch.Tensor:
+        """The expert numbers set in ``mask``, packed from the front and padded with -1 to length E."""
+        E = self.num_experts
+        rank = torch.cumsum(mask.to(torch.int64), 0) - 1
+        out = torch.full((E + 1,), -1, dtype=torch.int64, device=self.device)
+        out.index_put_((torch.where(mask, rank, E),), self.experts)
+        return out[:E]
+
+    def seed(
+        self, vram: "ExpertTable", topk_ids: torch.Tensor, need: torch.Tensor
+    ) -> None:
+        """Update this table (the RAM tier) from the prefill's routing.
+
+        Acquires the R - S most referenced experts of ``topk_ids``, then the
+        experts that are in the VRAM tier ``vram``. The latter get the newer
+        timestamp, so in the following decode steps the RAM tier never evicts a
+        VRAM-tier expert first and RAM stays a superset of VRAM. VRAM-tier
+        experts that are neither in the RAM tier nor referenced this step
+        (``need``) are left out: a slot for them would never get its row read.
+        Seeding is not a reference, so hits / misses are not counted.
+        """
+        E, R, S = self.num_experts, self.num_slots, vram.num_slots
+        hits, misses = self.hits.clone(), self.misses.clone()
+        # Reference counts. bincount sizes its output from the values (a sync),
+        # so index_add_ into a fixed length instead.
+        ids = self._ids(topk_ids)
+        counts = torch.zeros((E + 1,), dtype=torch.int64, device=self.device)
+        counts.index_add_(0, ids, torch.ones_like(ids))
+        counts = counts[:E]
+        top = counts.topk(max(R - S, 1)).indices
+        # Fill unreferenced entries with the most frequent expert (need_mask
+        # removes the duplicates).
+        top = torch.where(counts[top] > 0, top, top[:1])
+        if R > S:
+            self.acquire(top)
+        v = vram.expert_in[:S]
+        ok = (v >= 0) & ((self.slot_of[v.clamp(min=0)] >= 0) | need[v.clamp(min=0)])
+        self.acquire(torch.where(ok, v, top[:1]))
+        self.hits.copy_(hits)
+        self.misses.copy_(misses)
+
+    def plan_working(
+        self,
+        before: torch.Tensor,
+        need: torch.Tensor,
+        cached_row: torch.Tensor,
+        dst_row: torch.Tensor,
+        ram_base: int,
+        working_base: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assign rows on the working-buffer path after the table was updated.
+
+        ``before`` is ``slot_of[:E]`` from before the update. Returns
+        ``(src_row, todo, ssd_todo, late)``.
+
+        - Experts whose old slot is still usable (unchanged, or evicted so the
+          slot is being freed) are copied from that slot. Evicted rows must be
+          copied before fetch overwrites them, so they go into ``todo``
+        - The other needed experts, and experts that moved to another slot, are
+          read from SSD (``ssd_todo``). They land in their table slot, or in
+          the shared working row ``dst_row + working_base`` when not in the
+          table
+        - ``todo`` lists the experts that need no SSD wait (including VRAM
+          hits), ``late`` those copied after the read
+        """
+        after = self.slot_of[: self.num_experts]
+        old_ok = (before >= 0) & ((after < 0) | (after == before))
+        ssd = ~old_ok & (need | (before >= 0))
+        src_row = torch.where(
+            old_ok,
+            before + ram_base,
+            torch.where(after >= 0, after + ram_base, dst_row + working_base),
+        )
+        todo = self.pack(need & (old_ok | (cached_row >= 0)))
+        return src_row, todo, self.pack(ssd), self.pack(ssd & need)
