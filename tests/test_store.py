@@ -3,6 +3,9 @@
 The GPU writes a request to pinned memory, the host thread reads it, preadv's
 from the paging file into a RAM-tier row, and the GPU sees done and exits. Run
 that sequence many times through CUDA graph replay and check the row contents.
+The RAM-tier rows are compressed, so the expected values are built with
+codec.encode, or the rows are expanded with decode_rows and compared with the
+raw rows.
 """
 
 import os
@@ -14,11 +17,15 @@ pytest.importorskip("triton")
 if not torch.cuda.is_available() or not hasattr(os, "O_DIRECT"):
     pytest.skip("needs CUDA and O_DIRECT", allow_module_level=True)
 
-from vllm_expert_pager.gather import fetch_rows, gather_rows
+from vllm_expert_pager import codec
+from vllm_expert_pager.gather import fetch_decode_rows, fetch_rows, gather_rows
 from vllm_expert_pager.store import _READ_WORKERS, Store
 
 L, E, R = 2, 8, 4
-ROW_BYTES = {"w13_weight": 8192, "w2_weight": 4096}
+# Rows are multiples of codec.GROUP (16 KiB).
+ROW_BYTES = {"w13_weight": 2 * codec.GROUP, "w2_weight": codec.GROUP}
+# Small rows do not shrink (the header adds to them), so allow the raw size.
+PITCH = 1.0
 
 
 def pattern(layer: int, expert: int, name: str) -> torch.Tensor:
@@ -28,12 +35,29 @@ def pattern(layer: int, expert: int, name: str) -> torch.Tensor:
     )
 
 
-def make_store(tmp_path, num_layers: int, num_experts: int, ram_slots: int) -> Store:
+def encoded(store: Store, layer: int, expert: int, name: str) -> torch.Tensor:
+    """The contents (int32 words) a RAM-tier row is expected to hold."""
+    row = pattern(layer, expert, name)
+    if not store.compress:
+        return row
+    raw = row.view(torch.uint8).cuda()
+    return codec.encode(raw, store.pitch[name])[0].view(torch.int32).cpu()
+
+
+def make_store(
+    tmp_path,
+    num_layers: int,
+    num_experts: int,
+    ram_slots: int,
+    compress: bool = True,
+) -> Store:
     s = Store(
         num_layers,
         num_experts,
         ram_slots,
         ROW_BYTES,
+        compress,
+        PITCH,
         str(tmp_path / "expert_pager.bin"),
         torch.device("cuda"),
     )
@@ -44,9 +68,9 @@ def make_store(tmp_path, num_layers: int, num_experts: int, ram_slots: int) -> S
     return s
 
 
-@pytest.fixture
-def store(tmp_path):
-    return make_store(tmp_path, L, E, R)
+@pytest.fixture(params=[True, False], ids=["compressed", "raw"])
+def store(tmp_path, request):
+    return make_store(tmp_path, L, E, R, compress=request.param)
 
 
 def capture_fetch(store: Store, todo, row, layer: int) -> torch.cuda.CUDAGraph:
@@ -71,7 +95,7 @@ def test_warm_start_rows(store):
         for e in range(R):
             for name in ROW_BYTES:
                 assert torch.equal(
-                    store.pinned[name][layer * R + e], pattern(layer, e, name)
+                    store.pinned[name][layer * R + e], encoded(store, layer, e, name)
                 )
 
 
@@ -93,10 +117,10 @@ def test_fetch_reads_missing_experts_in_graph(store):
         assert store.failed is None, store.failed
         for name in ROW_BYTES:
             assert torch.equal(
-                store.pinned[name][layer * R + sa], pattern(layer, a, name)
+                store.pinned[name][layer * R + sa], encoded(store, layer, a, name)
             )
             assert torch.equal(
-                store.pinned[name][layer * R + sb], pattern(layer, b, name)
+                store.pinned[name][layer * R + sb], encoded(store, layer, b, name)
             )
     assert store.fetches == 20 and store.reads == 40
 
@@ -108,17 +132,26 @@ def test_fetch_reads_missing_experts_in_graph(store):
     assert int(store.req[0]) == seq_before
 
 
-def test_gather_with_fetch_copies_ram_hits_while_reading_ssd(store):
+def test_fetch_decode_expands_ram_hits_while_reading_ssd(store):
     # The decode shape: the first launch asks for the SSD read while copying
-    # the experts that are in RAM, and the second launch copies the experts
-    # once they are read. Driven through graph replay.
+    # (and, with compression, expanding) the experts that are in RAM, and the
+    # second launch copies the experts once they are read. Driven through graph
+    # replay; the slab contents must equal the raw rows.
     dev = torch.device("cuda")
     layer, S = 1, 3
     base = layer * R
     W = [n // 4 for n in ROW_BYTES.values()]
     src = [store.view[name] for name in ROW_BYTES]
     cache = [torch.zeros((S, w), dtype=torch.int32, device=dev) for w in W]
-    dst = [torch.zeros((S, w), dtype=torch.int32, device=dev) for w in W]
+    dst = [
+        torch.zeros((S, n), dtype=torch.uint8, device=dev) for n in ROW_BYTES.values()
+    ]
+    dst_rows = [d.view(torch.int32) for d in dst]
+    staging = [
+        torch.zeros((S, store.pitch[name]), dtype=torch.uint8, device=dev)
+        for name in ROW_BYTES
+    ]
+    stg = [t.view(torch.int32) for t in staging]
     scale = [
         torch.arange(E * 8, dtype=torch.int32, device=dev).view(E, 8) * (i + 1)
         for i in range(2)
@@ -129,13 +162,19 @@ def test_gather_with_fetch_copies_ram_hits_while_reading_ssd(store):
     dst_row = torch.zeros((E,), dtype=torch.int64, device=dev)
     cache_row = torch.full((E,), -1, dtype=torch.int64, device=dev)
     src_row = torch.zeros((E,), dtype=torch.int64, device=dev)
+    lut = store.layer_lut(layer)
 
     def step() -> None:
-        gather_rows(todo, dst_row, cache_row, src_row, base, src, cache, dst, scale, scale_dst,
-                    fetch=(ssd, layer, store))  # fmt: skip
-        gather_rows(
-            ssd, dst_row, cache_row, src_row, base, src, cache, dst, scale, scale_dst
-        )
+        if store.compress:
+            fetch_decode_rows(todo, ssd, dst_row, src_row, base, layer, store,
+                              src, dst, staging, scale, scale_dst, lut)  # fmt: skip
+        else:
+            gather_rows(todo, dst_row, cache_row, src_row, base, src, cache, dst_rows,
+                        None, scale, scale_dst, fetch=(ssd, layer, store))  # fmt: skip
+        gather_rows(ssd, dst_row, cache_row, src_row, base, src, cache, dst_rows,
+                    stg if store.compress else None, scale, scale_dst)  # fmt: skip
+        if store.compress:
+            codec.decode_rows(ssd, dst_row, cache_row, staging, dst, lut)
 
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
@@ -159,9 +198,9 @@ def test_gather_with_fetch_copies_ram_hits_while_reading_ssd(store):
         torch.cuda.synchronize()
         assert store.failed is None, store.failed
         for k, name in enumerate(ROW_BYTES):
-            assert torch.equal(dst[k][0], pattern(layer, a, name).to(dev))
-            assert torch.equal(dst[k][1], pattern(layer, c, name).to(dev))
-            assert torch.equal(dst[k][2], pattern(layer, b, name).to(dev))
+            raw = [pattern(layer, x, name).view(torch.uint8).to(dev) for x in (a, c, b)]
+            for row in range(3):
+                assert torch.equal(dst[k][row], raw[row])
             assert torch.equal(scale_dst[k][0], scale[k][a])
             assert torch.equal(scale_dst[k][1], scale[k][c])
             assert torch.equal(scale_dst[k][2], scale[k][b])
@@ -187,7 +226,7 @@ def test_fetch_reads_many_experts_at_once(tmp_path):
     assert store.fetches == 1 and store.reads == R2
     for s, e in enumerate(missing):
         for name in ROW_BYTES:
-            assert torch.equal(store.pinned[name][s], pattern(0, e, name))
+            assert torch.equal(store.pinned[name][s], encoded(store, 0, e, name))
 
 
 def test_failed_read_releases_gpu(store):
@@ -206,12 +245,17 @@ def test_failed_read_releases_gpu(store):
     torch.cuda.synchronize()
     assert store.failed is not None and "IndexError" in store.failed
     for name in ROW_BYTES:
-        assert torch.equal(store.pinned[name][layer * R + 0], pattern(layer, 5, name))
+        assert torch.equal(
+            store.pinned[name][layer * R + 0], encoded(store, layer, 5, name)
+        )
 
 
-def test_large_pinned_is_not_rounded_to_pow2(store):
+def test_large_pinned_is_not_rounded_to_pow2(tmp_path):
     # Store turns off the allocator's power-of-two rounding for large
-    # allocations (store.py). 1.5 GiB would become 2 GiB if rounded.
+    # allocations (store.py). 1.5 GiB would become 2 GiB if rounded. The
+    # allocation happens only once (a second one hits the allocator's cache and
+    # shows no increase), so this does not use the parametrized store fixture.
+    make_store(tmp_path, 1, 2, 1)
     n = 3 * 2**29
     key = "allocated_bytes.current"
     before = torch.cuda.host_memory_stats()[key]
@@ -224,4 +268,24 @@ def test_rejects_foreign_file(tmp_path):
     path = tmp_path / "expert_pager.bin"
     path.write_bytes(b"not a paging file")
     with pytest.raises(FileExistsError):
-        Store(L, E, R, ROW_BYTES, str(path), torch.device("cuda"))
+        Store(L, E, R, ROW_BYTES, True, PITCH, str(path), torch.device("cuda"))
+
+
+def test_rejects_rows_over_pitch(tmp_path):
+    # A row that does not shrink (uniform random) does not fit the pitch, and
+    # the error reports the ratio needed.
+    s = Store(
+        1,
+        2,
+        1,
+        ROW_BYTES,
+        True,
+        0.5,
+        str(tmp_path / "expert_pager.bin"),
+        torch.device("cuda"),
+    )
+    row = torch.randint(
+        -(2**31), 2**31 - 1, (ROW_BYTES["w2_weight"] // 4,), dtype=torch.int32
+    )
+    with pytest.raises(ValueError, match="VLLM_EXPERT_PAGER_PITCH must be at least"):
+        s.write(0, 0, "w2_weight", row)

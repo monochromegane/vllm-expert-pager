@@ -2,16 +2,19 @@
 
 Expert weights live in three tiers: the VRAM slab, pinned RAM, and a paging
 file on SSD. The plugin owns their placement from load time on and does not
-use vLLM's CPU offload.
+use vLLM's CPU offload. The RAM and SSD tiers hold the rows losslessly
+compressed, and the GPU expands them when copying into VRAM.
 
 - Construction: the (E, ...) weights allocated by create_weights are replaced
   with one-row placeholders
-- Loading: weight_loader is intercepted and each expert's weights are written
-  to the paging file and to the RAM tier (experts numbered below R)
-- Inference: only the experts needed in the step are copied into the slab, and
-  expert_map renumbers experts to slots before the kernel runs. Decisions are
-  made on device tensors and the host never reads a value. For experts not in
-  RAM the GPU asks a host thread to read them from SSD
+- Loading: weight_loader is intercepted and each expert's weights are
+  compressed and written to the paging file and to the RAM tier (experts
+  numbered below R)
+- Inference: only the experts needed in the step are copied into staging and
+  expanded into the slab, and expert_map renumbers experts to slots before the
+  kernel runs. Decisions are made on device tensors and the host never reads a
+  value. For experts not in RAM the GPU asks a host thread to read them from
+  SSD
 """
 
 import os
@@ -39,6 +42,19 @@ CACHE_SLOTS = int(os.environ.get("VLLM_EXPERT_PAGER_CACHE_SLOTS", "32"))
 RAM_SLOTS = os.environ.get("VLLM_EXPERT_PAGER_RAM_SLOTS")
 # Paging file. Required when RAM_SLOTS is smaller than the number of experts.
 SSD_PATH = os.environ.get("VLLM_EXPERT_PAGER_SSD_PATH")
+# Whether to compress the RAM and SSD tiers losslessly. auto compresses only
+# when the SSD tier is used (RAM_SLOTS below the number of experts). When every
+# expert fits in RAM there are no SSD reads, and the expansion (about
+# 10 ms/token) costs more than the 12% saved on PCIe. Without an SSD wait there
+# is nothing to hide the expansion under either.
+COMPRESS = os.environ.get("VLLM_EXPERT_PAGER_COMPRESS", "auto")
+# Fixed length of a compressed row as a ratio of the raw row. If an expert does
+# not fit, loading stops and reports the ratio needed. The largest ratio seen so
+# far (over 24,576 experts) is 0.877.
+PITCH_RATIO = float(os.environ.get("VLLM_EXPERT_PAGER_PITCH", "0.88"))
+# Number of staging rows for copying compressed rows in prefill (the working
+# buffer path). Rows are expanded this many at a time.
+_PREFILL_STAGING_ROWS = 16
 # Interval for logging the hit rate, in Python calls of forward per layer. 0
 # disables it. CUDA graph replay does not run Python, so the log only appears
 # when forward is called eagerly (prefill etc.). The counters themselves live
@@ -50,9 +66,11 @@ LOG_INTERVAL = int(os.environ.get("VLLM_EXPERT_PAGER_LOG_INTERVAL", "1000"))
 PARAMS = ("w13_weight", "w2_weight")
 
 _store: Store | None = None
-# Working buffer (weights and scales) shared across all layers. Layers run
-# sequentially on the same stream, so there is no cross-layer race.
+# Working buffer (weights and scales) shared across all layers, and the staging
+# for prefill. Layers run sequentially on the same stream, so there is no
+# cross-layer race.
 _working_slab: dict[str, torch.Tensor] | None = None
+_prefill_staging: list[torch.Tensor] | None = None
 
 
 class ExpertPagerRoutedExperts(RoutedExperts):
@@ -91,6 +109,12 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                     f"VLLM_EXPERT_PAGER_RAM_SLOTS={R} must be >= "
                     f"VLLM_EXPERT_PAGER_CACHE_SLOTS={CACHE_SLOTS}"
                 )
+            if COMPRESS not in ("auto", "on", "off"):
+                raise ValueError(
+                    "VLLM_EXPERT_PAGER_COMPRESS must be auto, on or off, "
+                    f"got {COMPRESS!r}"
+                )
+            compress = R < E if COMPRESS == "auto" else COMPRESS == "on"
             _store = Store(
                 num_layers=get_current_vllm_config().model_config.hf_text_config.num_hidden_layers,
                 num_experts=E,
@@ -98,23 +122,32 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 row_bytes={
                     n: p[0].numel() * p.element_size() for n, p in params.items()
                 },
+                compress=compress,
+                pitch_ratio=PITCH_RATIO,
                 path=SSD_PATH,
                 device=params["w13_weight"].device,
             )
         self._expert_pager_store = _store
         self._expert_pager_layer = _store.add_layer()
 
+        # Compression assumes raw fp8 rows. Rows repacked by Marlin scatter the
+        # exponent bits and do not compress.
+        if _store.compress and (
+            getattr(self.quant_method, "fp8_backend", None) == Fp8MoeBackend.MARLIN
+        ):
+            raise RuntimeError(
+                f"{self.layer_name}: vllm-expert-pager compresses raw fp8 rows and "
+                "does not support the MARLIN backend; set "
+                "VLLM_EXPERT_PAGER_COMPRESS=off"
+            )
         # Free the (E, ...) allocated by create_weights and keep only the shape.
-        # Marlin's process_weights_after_loading repacks every expert, so
-        # present E rows through a stride-0 expand. _expert_pager_setup shrinks
-        # it back to one row afterwards.
+        # process_weights_after_loading looks at every expert, so present E rows
+        # through a stride-0 expand. _expert_pager_setup shrinks it back to one
+        # row afterwards.
         for p in params.values():
             p.data = torch.empty(
                 (1, *p.shape[1:]), dtype=p.dtype, device=p.device
             ).expand(p.shape)
-        self._expert_pager_marlin = (
-            getattr(self.quant_method, "fp8_backend", None) == Fp8MoeBackend.MARLIN
-        )
         # w13 arrives as separate gate and up shards, so stage per expert until
         # both are in.
         self._expert_pager_stage: dict[int, tuple[torch.Tensor, set[str]]] = {}
@@ -166,43 +199,17 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 return True if return_success else None
             del self._expert_pager_stage[expert_id]
             self._expert_pager_store.write(
-                self._expert_pager_layer,
-                expert_id,
-                "w13_weight",
-                self._expert_pager_pack(buf),
+                self._expert_pager_layer, expert_id, "w13_weight", buf
             )
         elif param is self.w2_weight:
             self._expert_pager_store.write(
-                self._expert_pager_layer,
-                expert_id,
-                "w2_weight",
-                self._expert_pager_pack(loaded_weight),
+                self._expert_pager_layer, expert_id, "w2_weight", loaded_weight
             )
         else:
             return super().weight_loader(
                 param, loaded_weight, weight_name, shard_id, expert_id, return_success
             )
         return True if return_success else None
-
-    def _expert_pager_pack(self, w: torch.Tensor) -> torch.Tensor:
-        """Turn one expert's (n, k) into the form the kernel reads.
-
-        As-is for Triton, repacked for Marlin.
-        """
-        if not self._expert_pager_marlin:
-            return w
-        from vllm import _custom_ops as ops
-        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-            pack_fp8_to_int32,
-        )
-
-        # repack_weight from prepare_fp8_moe_layer_for_marlin applied to a
-        # single expert.
-        q = pack_fp8_to_int32(w.cuda(), size_k_first=False).T.contiguous()
-        perm = torch.empty(0, dtype=torch.int, device=q.device)
-        return ops.gptq_marlin_repack(
-            b_q_weight=q, perm=perm, size_k=w.shape[1], size_n=w.shape[0], num_bits=8
-        ).cpu()
 
     # ---- After loading ----
 
@@ -214,16 +221,15 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         store = self._expert_pager_store
         params = {name: getattr(self, name) for name in PARAMS}
         for name, p in params.items():
-            # Shrink the (E, ...) repacked by Marlin back to one row; for Triton
-            # this undoes the expand. The leading slice is contiguous, so
-            # contiguous() would not copy and the original (E, ...) would stay
-            # alive.
+            # Undo the expand and shrink back to one row. The leading slice is
+            # contiguous, so contiguous() would not copy and the original
+            # (E, ...) would stay alive.
             p.data = p.data[:1].clone()
-            if as_rows(p.data).shape[1] != store.pinned[name].shape[1]:
+            if p.data.numel() * p.element_size() != store.row_bytes[name]:
                 raise RuntimeError(
-                    f"{self.layer_name}: {name} row has {as_rows(p.data).shape[1]} words "
-                    f"after process_weights_after_loading, RAM rows have "
-                    f"{store.pinned[name].shape[1]}"
+                    f"{self.layer_name}: {name} row has "
+                    f"{p.data.numel() * p.element_size()} B after "
+                    f"process_weights_after_loading, expected {store.row_bytes[name]}"
                 )
         device = params["w13_weight"].device
         E = self.global_num_experts
@@ -263,12 +269,21 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             name: torch.empty((CACHE_SLOTS, *p.shape[1:]), dtype=p.dtype, device=device)
             for name, p in staged.items()
         }
-        global _working_slab
+        global _working_slab, _prefill_staging
         if _working_slab is None:
             _working_slab = {
                 name: torch.empty((E, *p.shape[1:]), dtype=p.dtype, device=device)
                 for name, p in staged.items()
             }
+            if store.compress:
+                _prefill_staging = [
+                    torch.empty(
+                        (_PREFILL_STAGING_ROWS, store.pitch[n]),
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                    for n in PARAMS
+                ]
         for name, p in staged.items():
             if _working_slab[name].shape[1:] != p.shape[1:]:
                 raise RuntimeError(
@@ -276,8 +291,8 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 )
         self._expert_pager_working_slab = _working_slab
 
-        # (S, W) / (E, W) int32 views handed to the gather kernel, as lists in
-        # name order.
+        # (S, W) / (E, W) int32 views handed to the gather kernel and (S, N) /
+        # (E, N) uint8 views handed to decode_rows, as lists in name order.
         order = list(PARAMS) + self._expert_pager_scale_names
         self._expert_pager_cache_rows = [
             as_rows(self._expert_pager_cache_slab[n]) for n in order
@@ -286,13 +301,39 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         self._expert_pager_scale_rows = [
             as_rows(scales[n].data) for n in self._expert_pager_scale_names
         ]
+        self._expert_pager_cache_bytes = [
+            self._expert_pager_cache_slab[n].view(torch.uint8).reshape(CACHE_SLOTS, -1)
+            for n in PARAMS
+        ]
+        self._expert_pager_working_bytes = [
+            _working_slab[n].view(torch.uint8).reshape(E, -1) for n in PARAMS
+        ]
+        # In decode (K <= S) the shared working buffer is idle, so its head
+        # serves as the staging for compressed rows (S rows x pitch). Prefill
+        # expands into the working buffer itself, so it has its own staging.
+        # Without compression no staging is needed (RAM-tier rows are copied
+        # straight into the slab).
+        self._expert_pager_decode_staging = (
+            [
+                _working_slab[n]
+                .view(torch.uint8)
+                .reshape(-1)[: CACHE_SLOTS * store.pitch[n]]
+                .view(CACHE_SLOTS, store.pitch[n])
+                for n in PARAMS
+            ]
+            if store.compress
+            else None
+        )
+        self._expert_pager_prefill_staging = _prefill_staging
         self._expert_pager_params = staged
 
         logger.info_once(
-            "vllm-expert-pager: %d cache slots/layer, %d RAM slots/layer, %s",
+            "vllm-expert-pager: %d cache slots/layer, %d RAM slots/layer, rows %s",
             CACHE_SLOTS,
             R,
-            "marlin repack" if self._expert_pager_marlin else "raw rows",
+            f"compressed to {'+'.join(str(store.pitch[n]) for n in PARAMS)} B"
+            if store.compress
+            else "raw",
         )
 
     # ---- forward ----
@@ -305,7 +346,8 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         shared_experts=None,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from vllm_expert_pager.gather import fetch_rows, gather_rows
+        from vllm_expert_pager.codec import decode_rows
+        from vllm_expert_pager.gather import fetch_decode_rows, fetch_rows, gather_rows
 
         store = self._expert_pager_store
         if store.failed is not None:
@@ -322,6 +364,8 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             # written directly into self._expert_pager_map.
             slabs = self._expert_pager_cache_slab
             dst_rows = self._expert_pager_cache_rows
+            dst_bytes = self._expert_pager_cache_bytes
+            staging = self._expert_pager_decode_staging
             todo, ssd_todo = self._expert_pager_acquire(topk_ids)
             dst_row, src_row = (
                 self._expert_pager_acquire.vram_slot,
@@ -329,15 +373,15 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             )
             cached_row = vram.no_cache  # read everything from the RAM tier
             base = layer * R
-            # Overlap the SSD read request and the gather of the experts that
-            # are in RAM in a single launch.
-            fetch = (ssd_todo, layer, store)
+            decode = True
         else:
             # May not fit in the slots, so use the working buffer without
             # updating the table. Experts that hit are copied from the cache
             # slab within VRAM.
             slabs = self._expert_pager_working_slab
             dst_rows = self._expert_pager_working_rows
+            dst_bytes = self._expert_pager_working_bytes
+            staging = self._expert_pager_prefill_staging
             expert_map, dst_row, cached_row, todo = vram.lookup(topk_ids)
             self._expert_pager_map.copy_(expert_map)
             if K <= R:
@@ -352,18 +396,33 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 )
                 ssd_todo = torch.where(in_ram[need.clamp(min=0)] >= 0, -1, need)
                 base = 0
-            fetch = None
+            decode = False
+        src = [store.view[n] for n in PARAMS]
+        lut = store.layer_lut(layer)
         rows = (
-            [store.view[n] for n in PARAMS],
+            src,
             self._expert_pager_cache_rows[:2],
             dst_rows[:2],
+            [t.view(torch.int32) for t in staging] if staging is not None else None,
             self._expert_pager_scale_rows,
             dst_rows[2:],
         )
-        if fetch is None:
-            fetch_rows(ssd_todo, src_row, base, layer, store)
+        if decode and store.compress:
+            # Overlap the SSD read request with the gather and expansion of the
+            # experts that are in RAM in a single launch.
+            fetch_decode_rows(
+                todo, ssd_todo, dst_row, src_row, base, layer, store,
+                src, dst_bytes, staging, self._expert_pager_scale_rows, dst_rows[2:], lut,
+            )  # fmt: skip
+        elif decode:
+            # Overlap the SSD read request and the gather of the experts that
+            # are in RAM in a single launch.
+            gather_rows(
+                todo, dst_row, cached_row, src_row, base, *rows,
+                fetch=(ssd_todo, layer, store),
+            )  # fmt: skip
         else:
-            gather_rows(todo, dst_row, cached_row, src_row, base, *rows, fetch=fetch)
+            fetch_rows(ssd_todo, src_row, base, layer, store)
         if store.path is not None and not torch.cuda.is_current_stream_capturing():
             # In eager mode Python keeps queuing kernels for later layers, and
             # once the launch queue is full that launch blocks while holding the
@@ -374,16 +433,23 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             # so it needs none of this.
             torch.cuda.current_stream().synchronize()
 
-        # In decode only the experts read from SSD (those that were in RAM were
-        # copied by the launch above).
-        gather_rows(
-            todo if fetch is None else ssd_todo,
-            dst_row,
-            cached_row,
-            src_row,
-            base,
-            *rows,
-        )
+        if decode:
+            # Experts that were in RAM are done by the launch above. Copy the
+            # ones read from SSD.
+            gather_rows(ssd_todo, dst_row, cached_row, src_row, base, *rows)
+            if store.compress:
+                decode_rows(ssd_todo, dst_row, cached_row, staging, dst_bytes, lut)
+        elif store.compress:
+            # Prefill. A staging's worth of rows at a time, copy from the RAM
+            # tier (and the shared rows read from SSD) into staging and expand.
+            # VRAM hits are copied raw from the cache slab.
+            B = staging[0].shape[0]
+            for b in range(0, todo.shape[0], B):
+                part = todo[b : b + B]
+                gather_rows(part, dst_row, cached_row, src_row, base, *rows)
+                decode_rows(part, dst_row, cached_row, staging, dst_bytes, lut)
+        else:
+            gather_rows(todo, dst_row, cached_row, src_row, base, *rows)
 
         self._expert_pager_log()
 
