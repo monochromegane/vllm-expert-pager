@@ -22,6 +22,13 @@ There are two paths:
 The SMs copy with loads and stores instead of ``cudaMemcpyAsync``. A memcpy has
 fixed addresses, so putting one in a graph would mean "copy the same expert
 every time".
+
+Only ``_PROGRAMS`` copying programs are launched, and they walk the (row, chunk)
+pairs in turn. Launching one program per chunk and letting them all read at
+once fills the memory system with requests waiting on PCIe: the copy tops out
+at 12 GB/s, and the memory accesses of other kernels queue behind it, so
+nothing overlaps on another stream. Keeping about 64 KiB in flight gives 23 to
+24 GB/s (the same as the copy engine) and overlaps with other kernels.
 """
 
 import torch
@@ -30,8 +37,11 @@ import triton.language as tl
 
 from vllm_expert_pager import codec
 
-# Number of words one program copies (int32, so 16 KiB).
+# Words per copy (int32, so 16 KiB) and the number of copying programs. The
+# amount in flight is _PROGRAMS x _BLOCK x 4 B = 64 KiB. One row or 200 rows
+# both reach 23 to 24 GB/s; more or less in flight is slower.
 _BLOCK = 4096
+_PROGRAMS = 4
 # After this many idle spins waiting for done, the request is published again.
 # One spin is one volatile load across PCIe, measured at 514 spins/ms (GPU
 # otherwise idle) to 220 spins/ms (overlapping compute), so 0.5 to 1.2 s. It is
@@ -99,42 +109,50 @@ def _copy_scale(
 
 
 @triton.jit
-def _gather_one(
-    j, c,  # index into todo and chunk number
+def _gather_loop(
+    pid, K, C,  # program number, number of rows, chunks per row (C0 + C1)
     todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
     src0_ptr, cache0_ptr, dst0_ptr, stg0_ptr, W0, P0, C0,
     src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, W1, P1,
     scale0_ptr, sdst0_ptr, SW0,
     scale1_ptr, sdst1_ptr, SW1,
-    ssd_ptr, K,  # experts to read from SSD (length K, padded with -1)
+    ssd_ptr,  # experts to read from SSD (length K, padded with -1)
     BLOCK: tl.constexpr,
     SBLOCK: tl.constexpr,
     COMPRESS: tl.constexpr,
     SKIP_SSD: tl.constexpr,  # experts in the list are not copied (a separate launch copies them after the SSD read)
+    PROGRAMS: tl.constexpr,
 ):  # fmt: skip
-    e = tl.load(todo_ptr + j)
-    active = e >= 0
-    if SKIP_SSD:
-        for k in range(K):
-            active = active & (tl.load(ssd_ptr + k) != e)
-    # Keep the index in range for empty entries; the value read is discarded.
-    e = tl.maximum(e, 0)
-    dst_row = tl.maximum(tl.load(dst_row_ptr + e), 0)
-    cache_row = tl.load(cache_row_ptr + e)
-    src_row = tl.load(src_row_ptr + e) + base
-    j = j.to(tl.int64)
+    """Walk the rows of todo in order; of each row, copy the chunks pid, pid + PROGRAMS, ...
 
-    # Weights are copied per name in chunks of BLOCK words. The program for the
-    # first chunk of each name copies that name's whole scale row (it only needs
-    # updating when the slot's contents change).
-    if c < C0:
-        _copy_row(c, W0, P0, src0_ptr, cache0_ptr, dst0_ptr, stg0_ptr, src_row, cache_row, dst_row, j, active, BLOCK, COMPRESS)  # fmt: skip
-        if c == 0:
-            _copy_scale(SW0, scale0_ptr, sdst0_ptr, e, dst_row, active, SBLOCK)
-    else:
-        _copy_row(c - C0, W1, P1, src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, src_row, cache_row, dst_row, j, active, BLOCK, COMPRESS)  # fmt: skip
-        if c == C0:
-            _copy_scale(SW1, scale1_ptr, sdst1_ptr, e, dst_row, active, SBLOCK)
+    Weights are copied per name in chunks of BLOCK words. The program for the
+    first chunk of each name copies that name's whole scale row (it only needs
+    updating when the slot's contents change).
+    """
+    for j in range(K):
+        e = tl.load(todo_ptr + j)
+        active = e >= 0
+        if SKIP_SSD:
+            for k in range(K):
+                active = active & (tl.load(ssd_ptr + k) != e)
+        if active:
+            dst_row = tl.maximum(tl.load(dst_row_ptr + e), 0)
+            cache_row = tl.load(cache_row_ptr + e)
+            src_row = tl.load(src_row_ptr + e) + base
+            jj = j.to(tl.int64)
+            for c in range(pid, C, PROGRAMS):
+                if c < C0:
+                    _copy_row(c, W0, P0, src0_ptr, cache0_ptr, dst0_ptr, stg0_ptr, src_row, cache_row, dst_row, jj, True, BLOCK, COMPRESS)  # fmt: skip
+                    if c == 0:
+                        _copy_scale(
+                            SW0, scale0_ptr, sdst0_ptr, e, dst_row, True, SBLOCK
+                        )
+                else:
+                    _copy_row(c - C0, W1, P1, src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, src_row, cache_row, dst_row, jj, True, BLOCK, COMPRESS)  # fmt: skip
+                    if c == C0:
+                        _copy_scale(
+                            SW1, scale1_ptr, sdst1_ptr, e, dst_row, True, SBLOCK
+                        )
 
 
 @triton.jit
@@ -148,7 +166,7 @@ def _gather_rows_kernel(
     src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, W1, P1,  # name 1 (w2)
     scale0_ptr, sdst0_ptr, SW0,  # scales of name 0
     scale1_ptr, sdst1_ptr, SW1,  # scales of name 1
-    ssd_ptr, K,  # with FETCH: experts to read from SSD (length K, padded with -1)
+    ssd_ptr, K, C,  # experts to read from SSD (length K, padded with -1). C is the chunks per row
     layer, seq_ptr, req_ptr, done_ptr,  # with FETCH: arguments of _fetch
     BLOCK: tl.constexpr,
     SBLOCK: tl.constexpr,
@@ -156,35 +174,32 @@ def _gather_rows_kernel(
     FETCH: tl.constexpr,
     FBLOCK: tl.constexpr,
     RING: tl.constexpr,
+    PROGRAMS: tl.constexpr,
 ):  # fmt: skip
-    j = tl.program_id(0)
-    c = tl.program_id(1)
+    pid = tl.program_id(0)
     if FETCH:
-        # Column 0 is reserved for the request. While program (0, 0) asks the
-        # host to read from SSD and waits, the programs of the other columns
-        # (other blocks) copy the experts that are in RAM, so the SSD wait and
-        # the PCIe gather overlap. Blocks are dispatched in order, so column 0
-        # runs first.
-        if c == 0:
-            if j == 0:
-                _fetch(ssd_ptr, src_row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, FBLOCK, RING)  # fmt: skip
+        # While the last program asks the host to read from SSD and waits, the
+        # other programs copy the experts that are in RAM, so the SSD wait and
+        # the PCIe gather overlap.
+        if pid == PROGRAMS:
+            _fetch(ssd_ptr, src_row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, FBLOCK, RING)  # fmt: skip
         else:
-            _gather_one(
-                j, c - 1,
+            _gather_loop(
+                pid, K, C,
                 todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
                 src0_ptr, cache0_ptr, dst0_ptr, stg0_ptr, W0, P0, C0,
                 src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, W1, P1,
                 scale0_ptr, sdst0_ptr, SW0, scale1_ptr, sdst1_ptr, SW1,
-                ssd_ptr, K, BLOCK, SBLOCK, COMPRESS, True,
+                ssd_ptr, BLOCK, SBLOCK, COMPRESS, True, PROGRAMS,
             )  # fmt: skip
     else:
-        _gather_one(
-            j, c,
+        _gather_loop(
+            pid, K, C,
             todo_ptr, dst_row_ptr, cache_row_ptr, src_row_ptr, base,
             src0_ptr, cache0_ptr, dst0_ptr, stg0_ptr, W0, P0, C0,
             src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, W1, P1,
             scale0_ptr, sdst0_ptr, SW0, scale1_ptr, sdst1_ptr, SW1,
-            ssd_ptr, K, BLOCK, SBLOCK, COMPRESS, False,
+            ssd_ptr, BLOCK, SBLOCK, COMPRESS, False, PROGRAMS,
         )  # fmt: skip
 
 
@@ -352,22 +367,24 @@ def gather_rows(
     if fetch is None:
         ssd, layer, store = todo, 0, None
         seq = req = done = todo  # unused
-        grid, fblock, ring = (K, C0 + C1), 16, 1
+        grid, fblock, ring = (_PROGRAMS,), 16, 1
     else:
         ssd, layer, store = fetch
         if ssd.shape[0] != K:
             raise ValueError(f"ssd_todo has {ssd.shape[0]} entries, todo has {K}")
         seq, req, done = store.seq, store.req_view, store.done_view
-        grid, fblock, ring = (K, C0 + C1 + 1), store.block, store.ring
+        # One extra program at the end publishes the request and waits.
+        grid, fblock, ring = (_PROGRAMS + 1,), store.block, store.ring
     _gather_rows_kernel[grid](
         todo, dst_row, cache_row, src_row, base,
         src[0], cache[0], dst[0], stg[0], W0, P0, C0,
         src[1], cache[1], dst[1], stg[1], W1, P1,
         scale[0], scale_dst[0], SW0,
         scale[1], scale_dst[1], SW1,
-        ssd, K, layer, seq, req, done,
+        ssd, K, C0 + C1, layer, seq, req, done,
         BLOCK=_BLOCK, SBLOCK=1 << (max(SW0, SW1) - 1).bit_length(),
         COMPRESS=compress, FETCH=fetch is not None, FBLOCK=fblock, RING=ring,
+        PROGRAMS=_PROGRAMS,
     )  # fmt: skip
 
 
