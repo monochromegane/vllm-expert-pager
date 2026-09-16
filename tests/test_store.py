@@ -20,7 +20,7 @@ if not torch.cuda.is_available() or not hasattr(os, "O_DIRECT"):
     pytest.skip("needs CUDA and O_DIRECT", allow_module_level=True)
 
 from vllm_expert_pager import codec
-from vllm_expert_pager.gather import fetch_decode_rows, fetch_rows, gather_rows
+from vllm_expert_pager.gather import fetch_rows, gather_rows
 from vllm_expert_pager.store import _READ_WORKERS, Store
 
 L, E, R = 2, 8, 4
@@ -149,11 +149,11 @@ def test_fetch_reads_missing_experts_in_graph(store):
     assert int(store.seq) == seq_before and store.fetches == 20
 
 
-def test_fetch_decode_expands_ram_hits_while_reading_ssd(store):
+def test_fetch_gathers_ram_hits_while_reading_ssd(store):
     # The decode shape: the first launch asks for the SSD read while copying
-    # (and, with compression, expanding) the experts that are in RAM, and the
-    # second launch copies the experts once they are read. Driven through graph
-    # replay; the slab contents must equal the raw rows.
+    # the experts that are in RAM (with compression, a separate launch expands
+    # them), and later launches copy the experts once they are read. Driven
+    # through graph replay; the slab contents must equal the raw rows.
     dev = torch.device("cuda")
     layer, S = 1, 3
     base = layer * R
@@ -184,14 +184,17 @@ def test_fetch_decode_expands_ram_hits_while_reading_ssd(store):
     lut = store.layer_lut(layer)
 
     def step() -> None:
+        # The same sequence as the decode path in experts.py. Publish the SSD
+        # request and, while waiting, copy the experts that are in RAM (into
+        # staging with compression); expand them in a separate launch. The
+        # experts read from SSD are copied afterwards.
+        stg_or_none = stg if store.compress else None
+        gather_rows(todo, dst_row, cache_row, src_row, base, src, cache, dst_rows,
+                    stg_or_none, scale, scale_dst, fetch=(ssd, layer, store))  # fmt: skip
         if store.compress:
-            fetch_decode_rows(todo, ssd, dst_row, src_row, base, layer, store,
-                              src, dst, staging, scale, scale_dst, lut)  # fmt: skip
-        else:
-            gather_rows(todo, dst_row, cache_row, src_row, base, src, cache, dst_rows,
-                        None, scale, scale_dst, fetch=(ssd, layer, store))  # fmt: skip
+            codec.decode_rows(todo, dst_row, cache_row, staging, dst, lut, skip=ssd)
         gather_rows(ssd, dst_row, cache_row, src_row, base, src, cache, dst_rows,
-                    stg if store.compress else None, scale, scale_dst)  # fmt: skip
+                    stg_or_none, scale, scale_dst)  # fmt: skip
         if store.compress:
             codec.decode_rows(ssd, dst_row, cache_row, staging, dst, lut)
 
