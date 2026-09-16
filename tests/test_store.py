@@ -1,15 +1,15 @@
 """Round-trip test of Store and the fetch kernel. Needs a GPU and Linux (O_DIRECT).
 
-The GPU writes a request to pinned memory, the host thread reads it, preadv's
+The GPU writes a request to pinned memory, the C host thread reads it, preadv's
 from the paging file into a RAM-tier row, and the GPU sees done and exits. Run
 that sequence many times through CUDA graph replay and check the row contents.
 The RAM-tier rows are compressed, so the expected values are built with
 codec.encode, or the rows are expanded with decode_rows and compared with the
-raw rows.
+raw rows. A slow host and a host that never answers are made with
+``Store.test_delay`` (a test-only delay on the C side).
 """
 
 import os
-import threading
 import time
 
 import pytest
@@ -70,9 +70,24 @@ def make_store(
     return s
 
 
+@pytest.fixture
+def make(tmp_path):
+    """``make(L, E, R, compress)`` builds a Store. The host threads are stopped afterwards."""
+    made = []
+
+    def _make(*args, **kwargs) -> Store:
+        s = make_store(tmp_path, *args, **kwargs)
+        made.append(s)
+        return s
+
+    yield _make
+    for s in made:
+        s.close()
+
+
 @pytest.fixture(params=[True, False], ids=["compressed", "raw"])
-def store(tmp_path, request):
-    return make_store(tmp_path, L, E, R, compress=request.param)
+def store(make, request):
+    return make(L, E, R, compress=request.param)
 
 
 def capture_fetch(store: Store, todo, row, layer: int) -> torch.cuda.CUDAGraph:
@@ -127,11 +142,11 @@ def test_fetch_reads_missing_experts_in_graph(store):
     assert store.fetches == 20 and store.reads == 40
 
     # An empty request never reaches the host.
-    seq_before = int(store.req[0])
+    seq_before = int(store.seq)
     todo.fill_(-1)
     g.replay()
     torch.cuda.synchronize()
-    assert int(store.req[0]) == seq_before
+    assert int(store.seq) == seq_before and store.fetches == 20
 
 
 def test_fetch_decode_expands_ram_hits_while_reading_ssd(store):
@@ -160,7 +175,9 @@ def test_fetch_decode_expands_ram_hits_while_reading_ssd(store):
     ]
     scale_dst = [torch.zeros((S, 8), dtype=torch.int32, device=dev) for _ in range(2)]
     todo = torch.full((S,), -1, dtype=torch.int64, device=dev)  # VRAM misses
-    ssd = torch.full((S,), -1, dtype=torch.int64, device=dev)  # those read from SSD
+    ssd = torch.full(
+        (S,), -1, dtype=torch.int64, device=dev
+    )  # those among them read from SSD
     dst_row = torch.zeros((E,), dtype=torch.int64, device=dev)
     cache_row = torch.full((E,), -1, dtype=torch.int64, device=dev)
     src_row = torch.zeros((E,), dtype=torch.int64, device=dev)
@@ -209,11 +226,11 @@ def test_fetch_decode_expands_ram_hits_while_reading_ssd(store):
     assert store.fetches == 6 and store.reads == 6
 
 
-def test_fetch_reads_many_experts_at_once(tmp_path):
+def test_fetch_reads_many_experts_at_once(make):
     # Read more experts than there are threads in one request and check that
     # done is written only once all of them are in. Expert R+s goes to slot s.
     E2, R2 = 4 * _READ_WORKERS, 2 * _READ_WORKERS
-    store = make_store(tmp_path, 1, E2, R2)
+    store = make(1, E2, R2)
     dev = torch.device("cuda")
     todo = torch.full((R2,), -1, dtype=torch.int64, device=dev)
     row = torch.zeros((E2,), dtype=torch.int64, device=dev)
@@ -245,7 +262,9 @@ def test_failed_read_releases_gpu(store):
     row[4], row[5] = 10**6, 0
     g.replay()
     torch.cuda.synchronize()
-    assert store.failed is not None and "IndexError" in store.failed
+    assert store.failed is not None and "outside the RAM tier" in store.failed, (
+        store.failed
+    )
     for name in ROW_BYTES:
         assert torch.equal(
             store.pinned[name][layer * R + 0], encoded(store, layer, 5, name)
@@ -262,13 +281,7 @@ def test_slow_host_makes_the_fetch_republish_the_request(store):
     layer = 1
     g = capture_fetch(store, todo, row, layer)
 
-    read = store._read
-
-    def slow(*args):
-        time.sleep(1.5)  # longer than the re-publish interval (0.5 to 1.2 s)
-        read(*args)
-
-    store._read = slow
+    store.test_delay(1.5)  # longer than the re-publish interval (0.5 to 1.2 s)
     todo.copy_(torch.tensor([4, -1, -1, -1], device=dev))
     row[4] = 0
     g.replay()
@@ -293,19 +306,25 @@ def test_fetch_gives_up_when_the_host_never_answers(store):
     row = torch.zeros((E,), dtype=torch.int64, device=dev)
     g = capture_fetch(store, todo, row, 1)
 
-    release = threading.Event()
-    store._read = lambda *args: release.wait(60)
+    store.test_delay(60.0)
     todo.copy_(torch.tensor([4, -1, -1, -1], device=dev))
     row[4] = 0
     t0 = time.perf_counter()
     g.replay()
     torch.cuda.synchronize()
     waited = time.perf_counter() - t0
-    release.set()
+    store.test_delay(0.0)
 
     assert waited < 30, f"the fetch waited {waited:.1f} s"
     assert int(store.req[store.giveup_at]) == 1
     assert int(store.req[store.retry_at]) >= 1
+    # Once released, the host serves the request late, and the given-up
+    # request does not show as a gap in seq.
+    for _ in range(200):
+        if store.fetches == 1:
+            break
+        time.sleep(0.01)
+    assert store.fetches == 1 and store.missed == 0
 
 
 def test_serve_resends_done_when_the_fetch_is_still_spinning(store):
@@ -332,12 +351,12 @@ def test_serve_resends_done_when_the_fetch_is_still_spinning(store):
     assert int(store.done[0]) == served
 
 
-def test_large_pinned_is_not_rounded_to_pow2(tmp_path):
+def test_large_pinned_is_not_rounded_to_pow2(make):
     # Store turns off the allocator's power-of-two rounding for large
     # allocations (store.py). 1.5 GiB would become 2 GiB if rounded. The
     # allocation happens only once (a second one hits the allocator's cache and
     # shows no increase), so this does not use the parametrized store fixture.
-    make_store(tmp_path, 1, 2, 1)
+    make(1, 2, 1)
     n = 3 * 2**29
     key = "allocated_bytes.current"
     before = torch.cuda.host_memory_stats()[key]
@@ -366,8 +385,13 @@ def test_rejects_rows_over_pitch(tmp_path):
         str(tmp_path / "expert_pager.bin"),
         torch.device("cuda"),
     )
-    row = torch.randint(
-        -(2**31), 2**31 - 1, (ROW_BYTES["w2_weight"] // 4,), dtype=torch.int32
-    )
-    with pytest.raises(ValueError, match="VLLM_EXPERT_PAGER_PITCH must be at least"):
-        s.write(0, 0, "w2_weight", row)
+    try:
+        row = torch.randint(
+            -(2**31), 2**31 - 1, (ROW_BYTES["w2_weight"] // 4,), dtype=torch.int32
+        )
+        with pytest.raises(
+            ValueError, match="VLLM_EXPERT_PAGER_PITCH must be at least"
+        ):
+            s.write(0, 0, "w2_weight", row)
+    finally:
+        s.close()

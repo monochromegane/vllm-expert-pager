@@ -13,8 +13,8 @@ compressed, and the GPU expands them when copying into VRAM.
 - Inference: only the experts needed in the step are copied into staging and
   expanded into the slab, and expert_map renumbers experts to slots before the
   kernel runs. Decisions are made on device tensors and the host never reads a
-  value. For experts not in RAM the GPU asks a host thread to read them from
-  SSD
+  value. For experts not in RAM the GPU asks a C thread on the host to read
+  them from SSD
 """
 
 import os
@@ -448,15 +448,6 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             # overwrites them.
             copy_working(todo)
             fetch_rows(ssd_todo, src_row, base, layer, store)
-        if store.path is not None and not torch.cuda.is_current_stream_capturing():
-            # In eager mode Python keeps queuing kernels for later layers, and
-            # once the launch queue is full that launch blocks while holding the
-            # GIL (Triton's launcher does not release it). The GPU is waiting in
-            # fetch for the host's done, and the host thread is waiting for the
-            # GIL: a deadlock (reproduced on WSL2). Wait for the fetch to finish
-            # with the GIL released. Graph replay does not run Python per layer,
-            # so it needs none of this.
-            torch.cuda.current_stream().synchronize()
 
         if decode:
             # Experts that were in RAM are done by the launch above. Copy the
