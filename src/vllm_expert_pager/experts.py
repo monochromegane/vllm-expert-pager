@@ -347,7 +347,7 @@ class ExpertPagerRoutedExperts(RoutedExperts):
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm_expert_pager.codec import decode_rows
-        from vllm_expert_pager.gather import fetch_decode_rows, fetch_rows, gather_rows
+        from vllm_expert_pager.gather import fetch_rows, gather_rows
 
         store = self._expert_pager_store
         if store.failed is not None:
@@ -427,20 +427,21 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 gather_rows(part, dst_row, cached_row, src_row, base, *rows)
                 decode_rows(part, dst_row, cached_row, staging, dst_bytes, lut)
 
-        if decode and store.compress:
-            # Overlap the SSD read request with the gather and expansion of the
-            # experts that are in RAM in a single launch.
-            fetch_decode_rows(
-                todo, ssd_todo, dst_row, src_row, base, layer, store,
-                src, dst_bytes, staging, self._expert_pager_scale_rows, dst_rows[2:], lut,
-            )  # fmt: skip
-        elif decode:
+        if decode:
             # Overlap the SSD read request and the gather of the experts that
-            # are in RAM in a single launch.
+            # are in RAM in a single launch. With compression the rows go to
+            # staging and a separate launch expands them: it only reads and
+            # writes device memory, so it is fast and overlaps other kernels.
+            # Fusing the copy into the expansion issued the copy's requests all
+            # at once and halved the bandwidth.
             gather_rows(
                 todo, dst_row, cached_row, src_row, base, *rows,
                 fetch=(ssd_todo, layer, store),
             )  # fmt: skip
+            if store.compress:
+                decode_rows(
+                    todo, dst_row, cached_row, staging, dst_bytes, lut, skip=ssd_todo
+                )
         else:
             # Copy the experts that need no SSD wait (VRAM hits and rows in the
             # RAM tier) before asking for the SSD read, so that the slots of

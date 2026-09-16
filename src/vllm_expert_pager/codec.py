@@ -27,13 +27,13 @@ Record (N values, G = N / (CHUNK * LANES) groups):
 
 **The LUT (512 B) is not part of the record; it lives in a VRAM-resident table
 like the scales** (``Store.lut``, indexed by expert). Copying it per group would
-add 3.6% of PCIe traffic to a 14 KB group and halve the gain of the fused path
-(below).
+add 3.6% of PCIe traffic to a 14 KB group.
 
 Decoding group g needs only this LUT and two contiguous ranges of the record
-(the fixed-width words and the Huffman words), so ``copy_and_decode_group`` can
-copy those two ranges from the RAM tier into staging and expand them right
-away. When the gather kernel calls it, the expansion hides under the SSD wait.
+(the fixed-width words and the Huffman words). The copy (``gather.py``, RAM
+tier to staging) and the expansion (``decode_rows``) are separate launches:
+fusing them issues the copy's requests all at once and halves the PCIe
+bandwidth.
 
 Code lengths are limited to LIMIT bits; canonical Huffman codes are
 bit-reversed and packed from the LSB. Records have a fixed length ``pitch``; a
@@ -56,8 +56,6 @@ CHUNK = 512
 LANES = 32
 # The number of values in a row must be a multiple of this.
 GROUP = CHUNK * LANES
-# Words copied per load/store (in the copy part).
-COPY_BLOCK = 1024
 
 
 def _huffman_lengths(counts: list[float]) -> list[int]:
@@ -183,7 +181,7 @@ def encode(
     interleaved = words[src[torch.argsort(key[valid])]]
     per_group = nw.view(G, LANES).sum(1)
     # The last entry is the total word count. The words of group g are
-    # [gstart[g], gstart[g+1]), the range the fused path copies.
+    # [gstart[g], gstart[g+1]).
     gstart = torch.cat(
         [torch.cumsum(per_group, 0) - per_group, per_group.sum().view(1)]
     )
@@ -245,40 +243,6 @@ def _decode_group(
             o = ((s & 8) << 4) | ((ent >> 4) << 3) | (s & 7)
             out |= o.to(tl.int64) << (8 * k)
         tl.store(dst64 + m, out)
-
-
-@triton.jit
-def _copy_range(src32, dst32, start, count, BLOCK: tl.constexpr):
-    """Copy ``src32[start : start+count]`` to the same position in ``dst32``."""
-    for off in range(0, count, BLOCK):
-        offs = start + off + tl.arange(0, BLOCK)
-        m = offs < start + count
-        tl.store(dst32 + offs, tl.load(src32 + offs, mask=m, other=0), mask=m)
-
-
-@triton.jit
-def copy_and_decode_group(
-    lut8,  # uint8*  this row's LUT (VRAM resident)
-    src32,  # int32*  compressed record in the RAM tier (UVA)
-    stg32,  # int32*  the same row in staging
-    dst64,  # int64*  destination row (raw)
-    G, g, CHUNK,
-    LANES: tl.constexpr, LUT_BYTES: tl.constexpr, LIMIT: tl.constexpr,
-    COPY_BLOCK: tl.constexpr,
-):  # fmt: skip
-    """Copy the two ranges group g needs from the RAM tier into staging and expand into the slab.
-
-    Called from the gather kernel, the expansion proceeds under the SSD wait.
-    """
-    nib = (G + 1) + (g * (CHUNK // 8)) * LANES
-    huff = (G + 1) + (G * CHUNK * LANES) // 8
-    rp = tl.load(src32 + g)
-    rp_end = tl.load(src32 + g + 1)
-    _copy_range(src32, stg32, nib, (CHUNK // 8) * LANES, COPY_BLOCK)
-    _copy_range(src32, stg32, huff + rp, rp_end - rp, COPY_BLOCK)
-    # Other lanes of the same warp read the words copied here, so line up the writes.
-    tl.debug_barrier()
-    _decode_group(lut8, stg32, dst64, G, g, rp, CHUNK, LANES, LUT_BYTES, LIMIT)
 
 
 @triton.jit

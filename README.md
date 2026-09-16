@@ -48,8 +48,8 @@ Each MoE layer has its own slots in VRAM and in pinned host RAM, both managed
 as LRU caches. An expert missing from a tier is brought in from the tier to its
 left: a host thread reads the paging file into RAM, and a Triton kernel copies
 RAM into VRAM. When the SSD tier is used, the RAM and SSD tiers hold the rows
-losslessly compressed (the fp8 exponents are Huffman coded per row) and the
-kernel expands them while copying. Every decision is made on the GPU, so the
+losslessly compressed (the fp8 exponents are Huffman coded per row) and a GPU
+kernel expands them after the copy. Every decision is made on the GPU, so the
 model keeps running under CUDA graphs. When a step needs more experts than
 there are slots (large batches, prefill), the layer falls back to a working
 buffer that holds every needed expert.
