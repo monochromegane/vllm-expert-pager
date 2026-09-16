@@ -376,26 +376,28 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             decode = True
         else:
             # May not fit in the slots, so use the working buffer without
-            # updating the table. Experts that hit are copied from the cache
-            # slab within VRAM.
+            # updating the VRAM table. Experts that hit are copied from the
+            # cache slab within VRAM.
             slabs = self._expert_pager_working_slab
             dst_rows = self._expert_pager_working_rows
             dst_bytes = self._expert_pager_working_bytes
             staging = self._expert_pager_prefill_staging
-            expert_map, dst_row, cached_row, todo = vram.lookup(topk_ids)
+            expert_map, dst_row, cached_row, _ = vram.lookup(topk_ids)
             self._expert_pager_map.copy_(expert_map)
+            need = expert_map >= 0
+            before = ram.slot_of[: self.global_num_experts].clone()
             if K <= R:
-                _, src_row, ssd_todo = ram.acquire(topk_ids)
-                base = layer * R
+                ram.acquire(topk_ids)
             else:
-                # Does not fit in the RAM tier (prefill). Misses are read into
-                # the shared working rows.
-                _, packed, in_ram, need = ram.lookup(topk_ids)
-                src_row = torch.where(
-                    in_ram >= 0, in_ram + layer * R, packed + store.working_base
-                )
-                ssd_todo = torch.where(in_ram[need.clamp(min=0)] >= 0, -1, need)
-                base = 0
+                # Prefill (does not fit in the RAM tier either). Instead of
+                # leaving the table as lookup found it, put this step's most
+                # referenced experts in. Experts read from SSD go into slots,
+                # not into the shared working rows.
+                ram.seed(vram, topk_ids, need)
+            src_row, todo, ssd_todo, late = ram.plan_working(
+                before, need, cached_row, dst_row, layer * R, store.working_base
+            )
+            base = 0
             decode = False
         src = [store.view[n] for n in PARAMS]
         lut = store.layer_lut(layer)
@@ -407,6 +409,24 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             self._expert_pager_scale_rows,
             dst_rows[2:],
         )
+
+        def copy_working(part_list: torch.Tensor) -> None:
+            """Gather on the working-buffer path.
+
+            With compression, copy and expand a staging's worth of rows at a
+            time.
+            """
+            if not store.compress:
+                gather_rows(part_list, dst_row, cached_row, src_row, base, *rows)
+                return
+            # Copy from the RAM tier (and the shared rows read from SSD) into
+            # staging and expand. VRAM hits are copied raw from the cache slab.
+            B = staging[0].shape[0]
+            for b in range(0, part_list.shape[0], B):
+                part = part_list[b : b + B]
+                gather_rows(part, dst_row, cached_row, src_row, base, *rows)
+                decode_rows(part, dst_row, cached_row, staging, dst_bytes, lut)
+
         if decode and store.compress:
             # Overlap the SSD read request with the gather and expansion of the
             # experts that are in RAM in a single launch.
@@ -422,6 +442,11 @@ class ExpertPagerRoutedExperts(RoutedExperts):
                 fetch=(ssd_todo, layer, store),
             )  # fmt: skip
         else:
+            # Copy the experts that need no SSD wait (VRAM hits and rows in the
+            # RAM tier) before asking for the SSD read, so that the slots of
+            # experts evicted by the table update are copied before fetch
+            # overwrites them.
+            copy_working(todo)
             fetch_rows(ssd_todo, src_row, base, layer, store)
         if store.path is not None and not torch.cuda.is_current_stream_capturing():
             # In eager mode Python keeps queuing kernels for later layers, and
@@ -439,17 +464,9 @@ class ExpertPagerRoutedExperts(RoutedExperts):
             gather_rows(ssd_todo, dst_row, cached_row, src_row, base, *rows)
             if store.compress:
                 decode_rows(ssd_todo, dst_row, cached_row, staging, dst_bytes, lut)
-        elif store.compress:
-            # Prefill. A staging's worth of rows at a time, copy from the RAM
-            # tier (and the shared rows read from SSD) into staging and expand.
-            # VRAM hits are copied raw from the cache slab.
-            B = staging[0].shape[0]
-            for b in range(0, todo.shape[0], B):
-                part = todo[b : b + B]
-                gather_rows(part, dst_row, cached_row, src_row, base, *rows)
-                decode_rows(part, dst_row, cached_row, staging, dst_bytes, lut)
         else:
-            gather_rows(todo, dst_row, cached_row, src_row, base, *rows)
+            # Copy the experts read from SSD.
+            copy_working(late)
 
         self._expert_pager_log()
 
