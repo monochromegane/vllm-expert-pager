@@ -106,11 +106,11 @@ def _gather_one(
     src1_ptr, cache1_ptr, dst1_ptr, stg1_ptr, W1, P1,
     scale0_ptr, sdst0_ptr, SW0,
     scale1_ptr, sdst1_ptr, SW1,
-    ssd_ptr, K,  # with SKIP_SSD: experts in this list are not copied (a separate launch copies them after the SSD read)
+    ssd_ptr, K,  # experts to read from SSD (length K, padded with -1)
     BLOCK: tl.constexpr,
     SBLOCK: tl.constexpr,
     COMPRESS: tl.constexpr,
-    SKIP_SSD: tl.constexpr,
+    SKIP_SSD: tl.constexpr,  # experts in the list are not copied (a separate launch copies them after the SSD read)
 ):  # fmt: skip
     e = tl.load(todo_ptr + j)
     active = e >= 0
@@ -155,6 +155,7 @@ def _gather_rows_kernel(
     COMPRESS: tl.constexpr,
     FETCH: tl.constexpr,
     FBLOCK: tl.constexpr,
+    RING: tl.constexpr,
 ):  # fmt: skip
     j = tl.program_id(0)
     c = tl.program_id(1)
@@ -166,7 +167,7 @@ def _gather_rows_kernel(
         # runs first.
         if c == 0:
             if j == 0:
-                _fetch(ssd_ptr, src_row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, FBLOCK)  # fmt: skip
+                _fetch(ssd_ptr, src_row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, FBLOCK, RING)  # fmt: skip
         else:
             _gather_one(
                 j, c - 1,
@@ -188,34 +189,65 @@ def _gather_rows_kernel(
 
 
 @triton.jit
-def _fetch(
+def _fetch_publish(
     todo_ptr,  # int64[K]  experts to read from SSD. -1 is an empty entry
     row_ptr,  # int64[E]  expert -> RAM-tier row (before adding base)
     K,
     base,
     layer,
     seq_ptr,  # int64[1]  sequence number on the device
-    req_ptr,  # int64[4 + 2*BLOCK]  pinned. [seq, layer, expert[B], row[B], re-publishes, give-ups]
-    done_ptr,  # int64[1]  pinned. The host writes the seq it has finished
+    ticket_ptr,  # int64[1]  device. Receives the seq of the published request (_fetch_wait waits for it)
+    req_ptr,  # int64[2 + RING*(2+2B)]  pinned. [re-publishes, give-ups] + RING slots of [seq, layer, expert[B], row[B]]
     BLOCK: tl.constexpr,
+    RING: tl.constexpr,
 ):
+    """Ask the host to read the experts in ``todo`` from SSD, without waiting.
+
+    Does nothing if ``todo`` is empty. The request is written to slot
+    ``seq % RING``. The host serves requests in seq order, so up to RING of
+    them can be outstanding (store.py).
+    """
     offs = tl.arange(0, BLOCK)
     e = tl.load(todo_ptr + offs, mask=offs < K, other=-1)
     if tl.sum((e >= 0).to(tl.int32), axis=0) > 0:
         row = tl.load(row_ptr + tl.maximum(e, 0)) + base
-        # Write all of BLOCK so leftovers from the previous request are never
-        # read.
-        tl.store(req_ptr + 2 + offs, e)
-        tl.store(req_ptr + 2 + BLOCK + offs, tl.where(e >= 0, row, -1))
         seq = tl.load(seq_ptr) + 1
         tl.store(seq_ptr, seq)
+        tl.store(ticket_ptr, seq)
+        slot = req_ptr + 2 + (seq % RING) * (2 + 2 * BLOCK)
+        # Write all of BLOCK so leftovers from an earlier request are never
+        # read.
+        tl.store(slot + 2 + offs, e)
+        tl.store(slot + 2 + BLOCK + offs, tl.where(e >= 0, row, -1))
         # Triton may specialize layer into a constant, on which dtype conversion
         # cannot be called, so add it to an int64 zero to match the type.
-        tl.store(req_ptr + 1, seq * 0 + layer)
+        tl.store(slot + 1, seq * 0 + layer)
         # Publish seq only after every thread has finished writing. The release
         # makes the preceding writes visible to the host.
         tl.debug_barrier()
-        tl.atomic_xchg(req_ptr, seq, sem="release", scope="sys")
+        tl.atomic_xchg(slot, seq, sem="release", scope="sys")
+
+
+@triton.jit
+def _fetch_wait(
+    todo_ptr,  # int64[K]  the list passed to _fetch_publish
+    K,
+    ticket_ptr,  # int64[1]  device. The seq written by _fetch_publish
+    req_ptr,  # int64[2 + RING*(2+2B)]  pinned
+    done_ptr,  # int64[1]  pinned. The host writes the seq it has finished
+    BLOCK: tl.constexpr,
+    RING: tl.constexpr,
+):
+    """Wait for the done of the request published by ``_fetch_publish``.
+
+    Does nothing if ``todo`` is empty. done advances in order, so every request
+    before the awaited seq has finished as well.
+    """
+    offs = tl.arange(0, BLOCK)
+    e = tl.load(todo_ptr + offs, mask=offs < K, other=-1)
+    if tl.sum((e >= 0).to(tl.int32), axis=0) > 0:
+        seq = tl.load(ticket_ptr)
+        slot = req_ptr + 2 + (seq % RING) * (2 + 2 * BLOCK)
         d = tl.load(done_ptr, volatile=True)
         n = 0
         tries = 0
@@ -227,23 +259,34 @@ def _fetch(
                 # Still waiting: publish the request again and advance the
                 # re-publish count. If the request had not arrived, the host
                 # serves this as a new one; if it was already served
-                # (seq == last), the host sees the count change and rewrites
+                # (seq <= last), the host sees the count change and rewrites
                 # done. Either direction of a lost handoff recovers by itself.
-                tl.atomic_xchg(req_ptr, seq, sem="release", scope="sys")
-                tl.atomic_add(req_ptr + 2 + 2 * BLOCK, 1, sem="release", scope="sys")
+                tl.atomic_xchg(slot, seq, sem="release", scope="sys")
+                tl.atomic_add(req_ptr, 1, sem="release", scope="sys")
             d = tl.load(done_ptr, volatile=True)
         if d < seq:
             # Even the re-publishes did not get through. Stop waiting here, or
             # the server stays stuck. The rows of this layer stay stale, so
             # count it for the host to notice.
-            tl.atomic_add(req_ptr + 3 + 2 * BLOCK, 1, sem="release", scope="sys")
+            tl.atomic_add(req_ptr + 1, 1, sem="release", scope="sys")
+
+
+@triton.jit
+def _fetch(
+    todo_ptr, row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr,
+    BLOCK: tl.constexpr, RING: tl.constexpr,
+):  # fmt: skip
+    """Publish a request and wait for its done (``_fetch_publish`` + ``_fetch_wait``). The ticket is seq itself."""
+    _fetch_publish(todo_ptr, row_ptr, K, base, layer, seq_ptr, seq_ptr, req_ptr, BLOCK, RING)  # fmt: skip
+    _fetch_wait(todo_ptr, K, seq_ptr, req_ptr, done_ptr, BLOCK, RING)
 
 
 @triton.jit
 def _fetch_kernel(
-    todo_ptr, row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, BLOCK: tl.constexpr
-):
-    _fetch(todo_ptr, row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, BLOCK)
+    todo_ptr, row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr,
+    BLOCK: tl.constexpr, RING: tl.constexpr,
+):  # fmt: skip
+    _fetch(todo_ptr, row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, BLOCK, RING)
 
 
 def as_rows(t: torch.Tensor) -> torch.Tensor:
@@ -309,13 +352,13 @@ def gather_rows(
     if fetch is None:
         ssd, layer, store = todo, 0, None
         seq = req = done = todo  # unused
-        grid, fblock = (K, C0 + C1), 16
+        grid, fblock, ring = (K, C0 + C1), 16, 1
     else:
         ssd, layer, store = fetch
         if ssd.shape[0] != K:
             raise ValueError(f"ssd_todo has {ssd.shape[0]} entries, todo has {K}")
         seq, req, done = store.seq, store.req_view, store.done_view
-        grid, fblock = (K, C0 + C1 + 1), store.block
+        grid, fblock, ring = (K, C0 + C1 + 1), store.block, store.ring
     _gather_rows_kernel[grid](
         todo, dst_row, cache_row, src_row, base,
         src[0], cache[0], dst[0], stg[0], W0, P0, C0,
@@ -324,7 +367,7 @@ def gather_rows(
         scale[1], scale_dst[1], SW1,
         ssd, K, layer, seq, req, done,
         BLOCK=_BLOCK, SBLOCK=1 << (max(SW0, SW1) - 1).bit_length(),
-        COMPRESS=compress, FETCH=fetch is not None, FBLOCK=fblock,
+        COMPRESS=compress, FETCH=fetch is not None, FBLOCK=fblock, RING=ring,
     )  # fmt: skip
 
 
@@ -344,6 +387,7 @@ def _fetch_decode_kernel(
     CHUNK,
     SBLOCK: tl.constexpr,
     FBLOCK: tl.constexpr,
+    RING: tl.constexpr,
     LANES: tl.constexpr,
     LUT_BYTES: tl.constexpr,
     LIMIT: tl.constexpr,
@@ -360,7 +404,7 @@ def _fetch_decode_kernel(
         # Only program 0 of column 0 asks the host and waits. The others do
         # nothing.
         if j == 0:
-            _fetch(ssd_ptr, src_row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, FBLOCK)  # fmt: skip
+            _fetch(ssd_ptr, src_row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, FBLOCK, RING)  # fmt: skip
     else:
         e = tl.load(todo_ptr + j)
         # Programs for empty entries exit here (todo has a fixed length K and
@@ -437,7 +481,7 @@ def fetch_decode_rows(
         ssd_todo, todo.shape[0],
         layer, store.seq, store.req_view, store.done_view,
         chunk,
-        SBLOCK=1 << (max(SW0, SW1) - 1).bit_length(), FBLOCK=store.block,
+        SBLOCK=1 << (max(SW0, SW1) - 1).bit_length(), FBLOCK=store.block, RING=store.ring,
         LANES=codec.LANES, LUT_BYTES=codec.LUT_BYTES, LIMIT=codec.LIMIT,
         COPY_BLOCK=codec.COPY_BLOCK, num_warps=codec.LANES // 32,
     )  # fmt: skip
@@ -452,13 +496,6 @@ def fetch_rows(
     immediately if ``todo`` is empty.
     """
     _fetch_kernel[(1,)](
-        todo,
-        row,
-        todo.shape[0],
-        base,
-        layer,
-        store.seq,
-        store.req_view,
-        store.done_view,
-        BLOCK=store.block,
-    )
+        todo, row, todo.shape[0], base, layer, store.seq, store.req_view, store.done_view,
+        BLOCK=store.block, RING=store.ring,
+    )  # fmt: skip

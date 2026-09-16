@@ -62,6 +62,10 @@ buffer that holds every needed expert.
   quantization method. Tested with `Qwen/Qwen3.6-35B-A3B-FP8` on an RTX 4090
   (24 GB) using the Triton FP8 MoE backend.
 - A single GPU. Tensor parallelism and expert parallelism are not supported.
+- A C compiler (`cc`, or the one named by `CC`). The host thread that serves
+  the SSD reads is a small C program compiled with `-march=native` at the
+  first start and cached under `~/.cache/vllm_expert_pager` (or
+  `$XDG_CACHE_HOME/vllm_expert_pager`).
 - Linux. The SSD tier opens the paging file with `O_DIRECT`, so it has to be
   on a filesystem that supports it (ext4 does; `/mnt/c` under WSL2 does not).
   WSL2 itself works, but vLLM 0.29.0 needs `VLLM_WSL2_ENABLE_PIN_MEMORY=1`
