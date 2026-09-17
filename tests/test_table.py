@@ -144,40 +144,6 @@ def test_acquire_keeps_all_needed_when_full() -> None:
     assert sorted(emap[e] for e in (2, 3, 4, 5)) == [0, 1, 2, 3]
 
 
-def test_lookup_compacts_without_touching_table() -> None:
-    table = ExpertTable(E, 2, torch.device("cpu"))
-    table.acquire(torch.tensor([[5, 9]]))
-    snapshot = (table.slot_of.clone(), table.expert_in.clone(), table.last_used.clone())
-
-    ids = torch.tensor([[9, 3, 3], [12, 5, 9]])  # 6 elements > 2 slots
-    expert_map, slot, cached_slot, todo = table.lookup(ids)
-
-    need = sorted(unique_experts(ids))  # [3, 5, 9, 12]
-    emap = expert_map.tolist()
-    assert [emap[e] for e in need] == [0, 1, 2, 3]
-    assert all(emap[e] == -1 for e in range(E) if e not in need)
-    assert [slot[e].item() for e in need] == [0, 1, 2, 3]
-    # Position j in todo equals the packed slot.
-    assert todo.shape[0] == min(E, ids.numel())
-    assert todo.tolist() == need + [-1] * (todo.shape[0] - len(need))
-    # Only the hits, 5 and 9, have a slot on the cache slab.
-    assert cached_slot[5].item() >= 0 and cached_slot[9].item() >= 0
-    assert cached_slot[3].item() == -1 and cached_slot[12].item() == -1
-    # The table is unchanged.
-    for a, b in zip(snapshot, (table.slot_of, table.expert_in, table.last_used)):
-        assert torch.equal(a, b)
-    assert table.hits.item() == 0 and table.misses.item() == 2
-
-
-def test_lookup_todo_is_capped_at_num_experts() -> None:
-    table = ExpertTable(E, 2, torch.device("cpu"))
-    ids = torch.arange(E).repeat(3).reshape(3, E)  # 48 elements, every expert
-    expert_map, _, _, todo = table.lookup(ids)
-    assert todo.shape[0] == E
-    assert todo.tolist() == list(range(E))
-    assert expert_map.tolist() == list(range(E))
-
-
 def test_rejects_zero_slots() -> None:
     with pytest.raises(ValueError):
         ExpertTable(E, 0, torch.device("cpu"))
@@ -231,93 +197,186 @@ def test_seed_skips_vram_experts_that_have_no_row_to_read() -> None:
     assert {5, 6, 0} <= cached
 
 
-def simulate_working_step(ram, vram, ids, rows, ram_base, working_base):
-    """Mimic forward's order (copy, fetch, copy the rest) on the CPU.
+def simulate_working_step(ram, vram, ids, rows, W, ram_base, working_base):
+    """Mimic forward's per-chunk order (copy, next read, wait, copy, MoE) on the CPU.
 
-    Returns the working rows and the table state. ``rows`` holds the contents of
-    the RAM-tier rows (expert numbers, -1 for never written). The VRAM slab is
-    assumed to hold the rows of the experts in its table.
+    ``rows`` holds the contents of the RAM-tier and shared working rows (expert
+    numbers, -1 for never written). The VRAM slab is assumed to hold the rows of
+    the experts in its table. The host is assumed to finish a read as soon as it
+    is published, so chunk k+1's read lands before chunk k's wait (the harshest
+    condition for a read not overwriting a copy's source). For every chunk,
+    checks that the working slab holds the chunk's experts and that expert_map
+    points at their rows.
+
+    Returns:
+        ``(ssd, src_row)``: the experts read from SSD and each expert's RAM-tier row.
     """
+    E = ram.num_experts
     need = ram.need_mask(ids)
-    _, dst_row, cached_row, _ = vram.lookup(ids)
+    cached_row = vram.slot_of[:E]
     before = ram.slot_of[:E].clone()
     if ids.numel() <= ram.num_slots:
         ram.acquire(ids)
     else:
         ram.seed(vram, ids, need)
-    src_row, todo, ssd_todo, late = ram.plan_working(
-        before, need, cached_row, dst_row, ram_base, working_base
+    dst_row, src_row, maps, todo, ssd, late = ram.plan_chunks(
+        before, need, cached_row, W, ram_base, working_base
     )
-    working = torch.full((E,), -1)
+    N = maps.shape[0]
+    assert N == -(-E // W) + 1
+    assert todo.shape == ssd.shape == late.shape == (N * W,)
+    check_layout(todo, ssd, W)
 
-    def copy(part_list):
-        for e in part_list.tolist():
-            if e >= 0:
-                working[dst_row[e]] = e if cached_row[e] >= 0 else rows[src_row[e]]
+    def chunk(t, k):
+        return [e for e in t[k * W : (k + 1) * W].tolist() if e >= 0]
 
-    copy(todo)
-    for e in ssd_todo.tolist():
-        if e >= 0:
-            rows[src_row[e]] = e  # the host reads it from SSD
-    copy(late)
-    return need, dst_row, working, ssd_todo
+    working = torch.full((W,), -1)
+
+    def copy(experts):
+        for e in experts:
+            working[dst_row[e]] = e if cached_row[e] >= 0 else rows[src_row[e]]
+
+    def read(experts):
+        for e in experts:
+            rows[src_row[e]] = e
+
+    read(chunk(ssd, 0))
+    mapped = set()
+    for k in range(N):
+        copy(chunk(todo, k))
+        if k + 1 < N:
+            read(chunk(ssd, k + 1))
+        copy(chunk(late, k))
+        emap = maps[k].tolist()
+        for e, r in enumerate(emap):
+            if r < 0:
+                continue
+            assert need[e], f"expert {e} is mapped in chunk {k} but not needed"
+            assert r == dst_row[e] and working[r] == e, (
+                f"working row of expert {e} in chunk {k} is wrong"
+            )
+            assert e not in mapped, f"expert {e} is mapped twice"
+            mapped.add(e)
+        used = [r for r in emap if r >= 0]
+        assert len(used) == len(set(used)), f"chunk {k} maps two experts to one row"
+    assert mapped == set(need.nonzero().flatten().tolist())
+    return [e for e in ssd.tolist() if e >= 0], src_row
 
 
-def check_working_step(ram, need, dst_row, working, rows, ram_base):
-    for e in need.nonzero().flatten().tolist():
-        assert working[dst_row[e]] == e, f"working row of expert {e} is wrong"
+def check_layout(todo, ssd, W):
+    """The experts that need no wait are packed from the front; the experts read
+    from SSD follow from the next chunk boundary."""
+    ssd_set = {e for e in ssd.tolist() if e >= 0}
+    first = [i for i, e in enumerate(todo.tolist()) if e >= 0 and e not in ssd_set]
+    assert first == list(range(len(first)))
+    at = [i for i, e in enumerate(ssd.tolist()) if e >= 0]
+    boundary = -(-len(first) // W) * W
+    assert at == list(range(boundary, boundary + len(at)))
+
+
+def check_ram_rows(ram, rows, ram_base):
     for e in range(E):
         s = ram.slot_of[e].item()
         if s >= 0:
             assert rows[ram_base + s] == e, f"RAM row of expert {e} is stale"
 
 
-def test_plan_working_keeps_rows_truthful_through_a_seed() -> None:
-    R, S, L = 4, 2, 3
+def test_plan_chunks_keeps_rows_truthful_through_a_seed() -> None:
+    R, S, L, W = 4, 2, 3, 2
     layer = 1
     ram_base, working_base = layer * R, L * R
     ram = ExpertTable(E, R, torch.device("cpu"))
     vram = ExpertTable(E, S, torch.device("cpu"))
-    rows = torch.full((L * R + E,), -1)
+    rows = torch.full((L * R + 2 * W,), -1)
     ram.acquire(torch.tensor([[0, 1, 2, 3]]))
     for e in range(4):
         rows[ram_base + ram.slot_of[e]] = e
     vram.acquire(torch.tensor([[0, 9]]))
     # 5 and 6 rank highest and evict 0 and 1. 0 is in the VRAM tier and is
     # referenced, so it moves to another slot. 1 is evicted but referenced, so
-    # it must be copied before fetch overwrites its slot.
+    # it must be copied before a read overwrites its slot.
     ids = torch.tensor([[5, 6], [5, 6], [5, 0], [7, 1]])
-    need, dst_row, working, ssd_todo = simulate_working_step(
-        ram, vram, ids, rows, ram_base, working_base
+    ssd, src_row = simulate_working_step(
+        ram, vram, ids, rows, W, ram_base, working_base
     )
     check_invariants(ram)
-    check_working_step(ram, need, dst_row, working, rows, ram_base)
+    check_ram_rows(ram, rows, ram_base)
     cached = {e for e in range(E) if ram.slot_of[e] >= 0}
     assert cached == {5, 6, 0, 3}
     # Read from SSD: the newly seeded 5 and 6, the moved 0, and 7, which is not
     # in the table. 1, 2, 3 are not read.
-    assert sorted(e for e in ssd_todo.tolist() if e >= 0) == [0, 5, 6, 7]
+    assert sorted(ssd) == [0, 5, 6, 7]
     # 7 was read into a shared working row.
-    assert rows[working_base + dst_row[7]] == 7
+    assert working_base <= src_row[7] < working_base + 2 * W
+    assert rows[src_row[7]] == 7
 
 
-def test_plan_working_reads_only_misses_when_ram_acquires() -> None:
-    R, S, L = 4, 2, 2
+def test_plan_chunks_reads_only_misses_when_ram_acquires() -> None:
+    R, S, L, W = 4, 2, 2, 4
     ram_base, working_base = 0, L * R
     ram = ExpertTable(E, R, torch.device("cpu"))
     vram = ExpertTable(E, S, torch.device("cpu"))
-    rows = torch.full((L * R + E,), -1)
+    rows = torch.full((L * R + 2 * W,), -1)
     ram.acquire(torch.tensor([[0, 1, 2, 3]]))
     for e in range(4):
         rows[ram_base + ram.slot_of[e]] = e
     vram.acquire(torch.tensor([[2, 3]]))
     ids = torch.tensor([[2, 5], [3, 3]])  # 4 elements <= R: the RAM tier acquires
-    need, dst_row, working, ssd_todo = simulate_working_step(
-        ram, vram, ids, rows, ram_base, working_base
+    ssd, _ = simulate_working_step(ram, vram, ids, rows, W, ram_base, working_base)
+    check_invariants(ram)
+    check_ram_rows(ram, rows, ram_base)
+    assert ssd == [5]
+
+
+def test_plan_chunks_alternates_the_shared_rows() -> None:
+    # With more experts outside the table than W, several chunks use the shared
+    # rows. The two faces alternate, and chunk k+1's read must not overwrite
+    # chunk k's copy source (checked inside simulate_working_step).
+    R, S, L, W = 4, 2, 1, 3
+    ram_base, working_base = 0, L * R
+    ram = ExpertTable(E, R, torch.device("cpu"))
+    vram = ExpertTable(E, S, torch.device("cpu"))
+    rows = torch.full((L * R + 2 * W,), -1)
+    ids = torch.arange(12).reshape(3, 4)  # 12 experts; the RAM tier takes R - S = 2
+    ssd, src_row = simulate_working_step(
+        ram, vram, ids, rows, W, ram_base, working_base
     )
     check_invariants(ram)
-    check_working_step(ram, need, dst_row, working, rows, ram_base)
-    assert sorted(e for e in ssd_todo.tolist() if e >= 0) == [5]
+    assert sorted(ssd) == list(range(12))
+    shared = [
+        src_row[e].item() - working_base for e in ssd if src_row[e] >= working_base
+    ]
+    assert len(shared) == 10
+    # Faces 0 and 1 alternate per chunk, so both hold rows.
+    assert {r // W for r in shared} == {0, 1}
+
+
+@pytest.mark.parametrize("W", [1, 3, 4])
+def test_plan_chunks_random_steps(W: int) -> None:
+    # Mix decode steps (K <= S, both tables acquire) and working-buffer steps
+    # (K > S), and check that the RAM-tier rows of the experts in the table stay
+    # correct throughout and that each chunk's working slab is right.
+    rng = random.Random(W)
+    R, S, L = 6, 3, 2
+    layer = 1
+    ram_base, working_base = layer * R, L * R
+    ram = ExpertTable(E, R, torch.device("cpu"))
+    vram = ExpertTable(E, S, torch.device("cpu"))
+    rows = torch.full((L * R + 2 * W,), -1)
+    for _ in range(200):
+        k = rng.randint(1, 2 * E)
+        ids = torch.tensor([[rng.randrange(E) for _ in range(k)]])
+        if k <= S:
+            _, _, todo = ram.acquire(ids)
+            for e in todo.tolist():
+                if e >= 0:
+                    rows[ram_base + ram.slot_of[e]] = e
+            vram.acquire(ids)
+        else:
+            simulate_working_step(ram, vram, ids, rows, W, ram_base, working_base)
+        check_invariants(ram)
+        check_invariants(vram)
+        check_ram_rows(ram, rows, ram_base)
 
 
 def test_negative_ids_are_ignored() -> None:

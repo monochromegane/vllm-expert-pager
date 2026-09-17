@@ -28,6 +28,8 @@ L, E, R = 2, 8, 4
 ROW_BYTES = {"w13_weight": 2 * codec.GROUP, "w2_weight": codec.GROUP}
 # Small rows do not shrink (the header adds to them), so allow the raw size.
 PITCH = 1.0
+# Number of shared working rows. Not used here.
+WORKING_ROWS = 2
 
 
 def pattern(layer: int, expert: int, name: str) -> torch.Tensor:
@@ -57,6 +59,7 @@ def make_store(
         num_layers,
         num_experts,
         ram_slots,
+        WORKING_ROWS,
         ROW_BYTES,
         compress,
         PITCH,
@@ -372,7 +375,17 @@ def test_rejects_foreign_file(tmp_path):
     path = tmp_path / "expert_pager.bin"
     path.write_bytes(b"not a paging file")
     with pytest.raises(FileExistsError):
-        Store(L, E, R, ROW_BYTES, True, PITCH, str(path), torch.device("cuda"))
+        Store(
+            L,
+            E,
+            R,
+            WORKING_ROWS,
+            ROW_BYTES,
+            True,
+            PITCH,
+            str(path),
+            torch.device("cuda"),
+        )
 
 
 def test_rejects_rows_over_pitch(tmp_path):
@@ -382,6 +395,7 @@ def test_rejects_rows_over_pitch(tmp_path):
         1,
         2,
         1,
+        WORKING_ROWS,
         ROW_BYTES,
         True,
         0.5,
