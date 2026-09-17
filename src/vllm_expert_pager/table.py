@@ -129,30 +129,6 @@ class ExpertTable:
 
     # ---- Working-buffer path ----
 
-    def lookup(
-        self, topk_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Assign the needed experts to slots packed from 0 without updating the table.
-
-        Used when ``topk_ids.numel() > num_slots``, i.e. when the experts may
-        not fit in the cache slab. Experts that hit can be copied from the cache
-        slab within VRAM, so their slot numbers there are returned as well.
-
-        Returns:
-            ``(expert_map, slot, cached_slot, todo)``.
-            ``slot[e]`` is the packed slot, ``cached_slot[e]`` is the slot on
-            the cache slab (-1 if absent), and ``todo`` lists the needed experts
-            with length ``min(num_experts, topk_ids.numel())`` (padded with -1
-            at the end).
-        """
-        E = self.num_experts
-        K = min(E, topk_ids.numel())
-
-        need = self.need_mask(topk_ids)
-        slot = torch.cumsum(need.to(torch.int64), 0) - 1
-        expert_map = torch.where(need, slot, -1)
-        return expert_map, slot, self.slot_of[:E], self.pack(need)[:K]
-
     def pack(self, mask: torch.Tensor) -> torch.Tensor:
         """The expert numbers set in ``mask``, packed from the front and padded with -1 to length E."""
         E = self.num_experts
@@ -194,37 +170,78 @@ class ExpertTable:
         self.hits.copy_(hits)
         self.misses.copy_(misses)
 
-    def plan_working(
+    def plan_chunks(
         self,
         before: torch.Tensor,
         need: torch.Tensor,
         cached_row: torch.Tensor,
-        dst_row: torch.Tensor,
+        rows: int,
         ram_base: int,
         working_base: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Assign rows on the working-buffer path after the table was updated.
+    ) -> tuple[torch.Tensor, ...]:
+        """Arrange the experts of a working-buffer step into chunks of W rows after the table update.
 
-        ``before`` is ``slot_of[:E]`` from before the update. Returns
-        ``(src_row, todo, ssd_todo, late)``.
+        ``before`` is ``slot_of[:E]`` from before the update, ``cached_row`` is
+        the VRAM tier's ``slot_of[:E]``, and ``rows`` is the number of rows W of
+        the working slab. Every needed expert gets a position pos; its chunk is
+        pos // W and its row within the chunk pos % W. The number of chunks N is
+        ceil(E / W) + 1 and does not depend on the values.
 
-        - Experts whose old slot is still usable (unchanged, or evicted so the
-          slot is being freed) are copied from that slot. Evicted rows must be
-          copied before fetch overwrites them, so they go into ``todo``
+        - Experts that need no SSD wait (their old slot is still usable:
+          unchanged, or evicted so the slot is being freed) are packed from the
+          front. They are copied from that slot
         - The other needed experts, and experts that moved to another slot, are
-          read from SSD (``ssd_todo``). They land in their table slot, or in
-          the shared working row ``dst_row + working_base`` when not in the
-          table
-        - ``todo`` lists the experts that need no SSD wait (including VRAM
-          hits), ``late`` those copied after the read
+          read from SSD. They land in their table slot, or in a shared working
+          row (two faces, alternating per chunk) when not in the table. **This
+          group starts at the next chunk boundary.** A read is published after
+          the previous chunk's copies, so by the time the first read is issued
+          every expert that needs no wait has been copied, and a read never
+          overwrites the slot of an evicted expert before its copy
+
+        Returns:
+            ``(dst_row, src_row, maps, todo, ssd, late)``. ``dst_row[e]`` is the
+            row on the working slab, ``src_row[e]`` the RAM-tier row (also the
+            read destination), and ``maps[k]`` the ``expert_map`` of chunk k.
+            ``todo`` / ``ssd`` / ``late`` are lists of length N x W; chunk k
+            occupies ``[k*W:(k+1)*W]`` with each expert at its position within
+            the chunk and -1 elsewhere. ``todo`` lists the experts that need no
+            SSD wait (including VRAM hits), ``ssd`` the experts read from SSD,
+            and ``late`` the experts copied after the read.
         """
-        after = self.slot_of[: self.num_experts]
+        E, W = self.num_experts, rows
+        N = -(-E // W) + 1
+        after = self.slot_of[:E]
         old_ok = (before >= 0) & ((after < 0) | (after == before))
         ssd = ~old_ok & (need | (before >= 0))
+        first = need & ~ssd
+        a = torch.cumsum(first.to(torch.int64), 0)
+        b = torch.cumsum(ssd.to(torch.int64), 0)
+        boundary = (a[-1] + W - 1) // W * W
+        pos = torch.where(first, a - 1, boundary + b - 1)
+        dst_row = pos % W
+        shared = working_base + (pos // W % 2) * W + dst_row
         src_row = torch.where(
             old_ok,
             before + ram_base,
-            torch.where(after >= 0, after + ram_base, dst_row + working_base),
+            torch.where(after >= 0, after + ram_base, shared),
         )
-        todo = self.pack(need & (old_ok | (cached_row >= 0)))
-        return src_row, todo, self.pack(ssd), self.pack(ssd & need)
+        chunk = torch.where(need, pos // W, -1)
+        maps = torch.where(
+            chunk[None, :] == torch.arange(N, device=self.device)[:, None],
+            dst_row[None, :],
+            -1,
+        )
+
+        def listing(mask: torch.Tensor) -> torch.Tensor:
+            out = torch.full((N * W + 1,), -1, dtype=torch.int64, device=self.device)
+            out.index_put_((torch.where(mask, pos, N * W),), self.experts)
+            return out[: N * W]
+
+        return (
+            dst_row,
+            src_row,
+            maps,
+            listing(need & (~ssd | (cached_row >= 0))),
+            listing(ssd),
+            listing(need & ssd & (cached_row < 0)),
+        )

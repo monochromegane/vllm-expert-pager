@@ -2,8 +2,9 @@
 
 The RAM tier is an array of rows in pinned memory. The GPU reads it through a
 UVA view and the host writes it through a numpy view. Each layer has R rows,
-followed by E rows for prefill (shared by all layers); row numbers are unique
-across layers so the gather kernel has a single source.
+followed by the shared working rows for prefill (all layers; the SSD reads of
+experts that are not in the table land there); row numbers are unique across
+layers so the gather kernel has a single source.
 
 The SSD tier is a paging file of fixed-length records (the w13 row followed by
 the w2 row, each compressed and rounded up to its pitch) in [layer][expert]
@@ -355,6 +356,7 @@ class Store:
         num_layers: int,
         num_experts: int,
         ram_slots: int,
+        working_rows: int,
         row_bytes: dict[str, int],
         compress: bool,
         pitch_ratio: float,
@@ -366,6 +368,8 @@ class Store:
             raise ValueError(
                 f"VLLM_EXPERT_PAGER_RAM_SLOTS must be in [1, {E}], got {R}"
             )
+        if working_rows < 1:
+            raise ValueError(f"working_rows must be >= 1, got {working_rows}")
         if R < E and path is None:
             raise ValueError(
                 "VLLM_EXPERT_PAGER_SSD_PATH is required when "
@@ -397,21 +401,22 @@ class Store:
             self.offset[name] = pos
             pos += self.pitch[name]
 
-        # Rows [0, L*R) are the RAM tier (slot s of layer l is l*R + s); rows
-        # [L*R, L*R+E) are the shared working rows.
+        # Rows [0, L*R) are the RAM tier (slot s of layer l is l*R + s); the
+        # working_rows rows after them are the shared working rows.
         self.working_base = L * R
+        self.rows = L * R + working_rows
         torch._C._accelerator_setAllocatorSettings(
             f"pinned_max_round_threshold_mb:{_PINNED_ROUND_LIMIT_MB}"
         )
         logger.info(
             "vllm-expert-pager: RAM tier %d rows x %d B (%s) = %.2f GiB pinned",
-            L * R + E,
+            self.rows,
             self.record_bytes,
             f"compressed from {sum(row_bytes.values())} B" if compress else "raw",
-            (L * R + E) * self.record_bytes / 2**30,
+            self.rows * self.record_bytes / 2**30,
         )
         self.pinned = {
-            name: _pinned_aligned(L * R + E, nbytes // 4)
+            name: _pinned_aligned(self.rows, nbytes // 4)
             for name, nbytes in self.pitch.items()
         }
         # Per-row Huffman LUTs: lut[l, e, i] belongs to expert e of layer l,
@@ -444,8 +449,12 @@ class Store:
         self.done = torch.zeros((1,), dtype=torch.int64, device="cpu", pin_memory=True)
         self.req_view = get_accelerator_view_from_cpu_tensor(self.req)
         self.done_view = get_accelerator_view_from_cpu_tensor(self.done)
-        # Sequence number of the requests (device). Publishing advances it.
+        # Sequence number of the requests (device). Publishing advances it and
+        # also writes the published seq to a ticket, which the waiter waits for.
+        # Prefill publishes the next chunk's read before waiting for the current
+        # chunk, so it alternates between two tickets (ticket_chunk).
         self.seq = torch.zeros((1,), dtype=torch.int64, device=device)
+        self.ticket_chunk = torch.zeros((2,), dtype=torch.int64, device=device)
 
         self.path = path if R < E else None
         self.fd_w = self.fd_r = None
@@ -482,7 +491,7 @@ class Store:
             self.block,
             self.num_layers,
             self.num_experts,
-            self.working_base + self.num_experts,
+            self.rows,
             self.record_bytes,
             n,
             pinned,

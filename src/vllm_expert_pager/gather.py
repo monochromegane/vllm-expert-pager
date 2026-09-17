@@ -295,6 +295,22 @@ def _fetch_kernel(
     _fetch(todo_ptr, row_ptr, K, base, layer, seq_ptr, req_ptr, done_ptr, BLOCK, RING)
 
 
+@triton.jit
+def _fetch_publish_kernel(
+    todo_ptr, row_ptr, K, base, layer, seq_ptr, ticket_ptr, req_ptr,
+    BLOCK: tl.constexpr, RING: tl.constexpr,
+):  # fmt: skip
+    _fetch_publish(todo_ptr, row_ptr, K, base, layer, seq_ptr, ticket_ptr, req_ptr, BLOCK, RING)  # fmt: skip
+
+
+@triton.jit
+def _fetch_wait_kernel(
+    todo_ptr, K, ticket_ptr, req_ptr, done_ptr,
+    BLOCK: tl.constexpr, RING: tl.constexpr,
+):  # fmt: skip
+    _fetch_wait(todo_ptr, K, ticket_ptr, req_ptr, done_ptr, BLOCK, RING)
+
+
 def as_rows(t: torch.Tensor) -> torch.Tensor:
     """View a tensor whose leading axis is the expert axis as ``(E, W)`` int32.
 
@@ -387,5 +403,37 @@ def fetch_rows(
     """
     _fetch_kernel[(1,)](
         todo, row, todo.shape[0], base, layer, store.seq, store.req_view, store.done_view,
+        BLOCK=store.block, RING=store.ring,
+    )  # fmt: skip
+
+
+def fetch_publish_rows(
+    todo: torch.Tensor,
+    row: torch.Tensor,
+    base: int,
+    layer: int,
+    store,
+    ticket: torch.Tensor,
+) -> None:
+    """Publish the request of ``fetch_rows`` without waiting; ``fetch_wait_rows`` waits.
+
+    Work that does not depend on the read (copies of rows that are in RAM, the
+    MoE of the previous chunk) goes between the publish and the wait, so the SSD
+    read overlaps it. ``ticket`` (one int64 word on the device) receives the seq
+    of the published request. If ``todo`` is empty no request is published and
+    the current seq is written (waiting for it covers every earlier request).
+    Another request may be published before waiting, but at most ``store.ring``
+    requests can be outstanding.
+    """
+    _fetch_publish_kernel[(1,)](
+        todo, row, todo.shape[0], base, layer, store.seq, ticket, store.req_view,
+        BLOCK=store.block, RING=store.ring,
+    )  # fmt: skip
+
+
+def fetch_wait_rows(todo: torch.Tensor, store, ticket: torch.Tensor) -> None:
+    """Wait for done to reach the seq in ``ticket``. Does nothing if ``todo`` is empty."""
+    _fetch_wait_kernel[(1,)](
+        todo, todo.shape[0], ticket, store.req_view, store.done_view,
         BLOCK=store.block, RING=store.ring,
     )  # fmt: skip
