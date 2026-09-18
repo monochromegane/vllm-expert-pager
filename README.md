@@ -3,7 +3,7 @@
 vllm-expert-pager is a vLLM plugin for running Mixture-of-Experts (MoE) models
 whose expert weights do not fit in GPU memory. It pages expert weights on
 demand between VRAM, host RAM, and optionally SSD. Recently used experts stay
-cached. On an RTX 4090 (24 GB), a 35B-A3B FP8 model decodes 5.4 times faster
+cached. On an RTX 4090 (24 GB), a 35B-A3B FP8 model decodes 5.8 times faster
 than with vLLM's `--cpu-offload-gb` at the same VRAM budget (see Results).
 
 ## How it works
@@ -106,7 +106,7 @@ weights itself.
 | `VLLM_EXPERT_PAGER_RAM_SLOTS` | all experts | RAM-tier slots per layer. Must be at least `CACHE_SLOTS`. When smaller than the number of experts, the rest is paged in from SSD. |
 | `VLLM_EXPERT_PAGER_SSD_PATH` | none | Paging file. Required when `RAM_SLOTS` is smaller than the number of experts. It is written at startup and holds every expert of every layer. |
 | `VLLM_EXPERT_PAGER_COMPRESS` | `auto` | Whether to keep the RAM and SSD tiers losslessly compressed. `auto` compresses only when the SSD tier is used (`RAM_SLOTS` smaller than the number of experts); `on` and `off` force it. Not supported with the Marlin FP8 MoE backend. |
-| `VLLM_EXPERT_PAGER_PITCH` | `0.88` | Fixed length of a compressed row as a ratio of the raw row. If an expert does not fit, startup stops and reports the ratio needed. |
+| `VLLM_EXPERT_PAGER_PITCH` | `0.89` | Fixed length of a compressed row as a ratio of the raw row. If an expert does not fit, startup stops and reports the ratio needed. |
 | `VLLM_EXPERT_PAGER_WORKING_ROWS` | `64` | Rows of the working slab used when a step does not fit in the cache slots (prefill). The needed experts run through it in chunks of this many. One slab serves every layer, so a smaller value leaves VRAM for `CACHE_SLOTS`. With compression, `WORKING_ROWS` x raw row must be at least `CACHE_SLOTS` x compressed row (decode borrows the slab as staging). |
 | `VLLM_EXPERT_PAGER_LOG_INTERVAL` | `1000` | Log the cache hit rates every N eager forward calls per layer. `0` disables the log. |
 
@@ -115,35 +115,42 @@ per expert):
 
 | Setting | VRAM for experts | Pinned RAM | SSD |
 |---|---|---|---|
-| `CACHE_SLOTS=32`, `RAM_SLOTS=256` | about 3.9 GiB | 30.4 GiB | not used |
-| `CACHE_SLOTS=32`, `RAM_SLOTS=128` | about 4.1 GiB | 13.6 GiB | 26.4 GiB |
-| `CACHE_SLOTS=32`, `RAM_SLOTS=128`, `COMPRESS=off` | about 3.9 GiB | 15.4 GiB | 30 GiB |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=256` | 3.9 GiB | 30.4 GiB | not used |
+| `CACHE_SLOTS=102`, `RAM_SLOTS=256` | 12.1 GiB | 30.4 GiB | not used |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=128` | 4.1 GiB | 13.7 GiB | 26.7 GiB |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=128`, `COMPRESS=off` | 3.9 GiB | 15.4 GiB | 30.0 GiB |
+
+The VRAM column is `CACHE_SLOTS` slots plus the shared working slab, and
+compression adds the decoding tables on top of it.
 
 ## Results
 
 Measured on an RTX 4090 (24 GB) under WSL2 with vLLM 0.29.0 and
 `Qwen/Qwen3.6-35B-A3B-FP8`, started with `--max-model-len 4096
 --max-num-seqs 1` and vLLM's default CUDA graph mode. The client is
-`vllm bench serve` with one concurrent request, 1024 input and 256 output
-tokens, 4 prompts; each configuration was run twice and the second run is
-reported. TPOT is the time per output token, TTFT the time to first token.
-The baseline is vLLM's own `--cpu-offload-gb`. The measurements predate the
-compression of the RAM and SSD tiers, so the `RAM_SLOTS=128` row corresponds
-to `VLLM_EXPERT_PAGER_COMPRESS=off`. They also predate the chunked prefill, so
-the VRAM column includes a working buffer that held every expert.
+`vllm bench serve` with one concurrent request, the `random` dataset at 1024
+input and 256 output tokens, 4 prompts, `--ignore-eos --temperature 0 --seed 0`.
+Each configuration was run once to warm the caches and then twice more; the
+second measured run is reported. TPOT is the time per output token, TTFT the
+time to first token. The baseline is vLLM's own `--cpu-offload-gb`, restricted
+to the expert weights with `--cpu-offload-params w13_weight w2_weight` so that
+both sides place the same tensors.
 
 | Configuration | VRAM for experts | Pinned RAM | SSD | TPOT | TTFT | Output tok/s |
 |---|---|---|---|---|---|---|
-| `--cpu-offload-gb 32` (every expert on CPU) | 0 GiB | 30 GiB | - | 88.6 ms | 2671 ms | 10.1 |
-| `--cpu-offload-gb 17` | 13.0 GiB | 17 GiB | - | 52.1 ms | 1647 ms | 17.1 |
-| `CACHE_SLOTS=32`, `RAM_SLOTS=256` | 4.6 GiB | 30.75 GiB | - | 20.7 ms | 1511 ms | 37.7 |
-| `CACHE_SLOTS=102`, `RAM_SLOTS=256` | 12.8 GiB | 30.75 GiB | - | 9.6 ms | 1025 ms | 73.8 |
-| `CACHE_SLOTS=32`, `RAM_SLOTS=128` | 4.6 GiB | 15.75 GiB | 30 GiB | 27.7 ms | 3237 ms | 24.9 |
+| `--cpu-offload-gb 32` (every expert on CPU) | 0 GiB | 30 GiB | - | 90.1 ms | 2719 ms | 10.0 |
+| `--cpu-offload-gb 17` | 12.9 GiB | 17 GiB | - | 54.0 ms | 1694 ms | 16.6 |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=256` | 3.9 GiB | 30.4 GiB | - | 17.4 ms | 964 ms | 47.4 |
+| `CACHE_SLOTS=102`, `RAM_SLOTS=256` | 12.1 GiB | 30.4 GiB | - | 9.3 ms | 779 ms | 81.2 |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=256`, `COMPRESS=on` | 4.1 GiB | 27.1 GiB | - | 18.3 ms | 958 ms | 45.6 |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=128` | 4.1 GiB | 13.7 GiB | 26.7 GiB | 24.3 ms | 2318 ms | 30.1 |
+| `CACHE_SLOTS=32`, `RAM_SLOTS=128`, `COMPRESS=off` | 3.9 GiB | 15.4 GiB | 30.0 GiB | 22.9 ms | 2492 ms | 30.7 |
 
 - With about the same VRAM footprint (`CACHE_SLOTS=102` against
-  `--cpu-offload-gb 17`), decoding is 5.4 times faster. Against offloading
-  every expert it is 9.2 times faster.
-- The SSD tier costs about 7 ms per token at `RAM_SLOTS=128`, and TTFT grows
+  `--cpu-offload-gb 17`), decoding is 5.8 times faster. Against offloading
+  every expert it is 9.7 times faster. At `CACHE_SLOTS=32` — a third of that
+  VRAM — it is still 3.1 times faster than `--cpu-offload-gb 17`.
+- The SSD tier costs 5.5 ms per token at `RAM_SLOTS=128`, and TTFT grows
   because prefill reads every expert that is not in RAM.
 
 ## License
