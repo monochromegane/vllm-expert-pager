@@ -51,9 +51,13 @@ SSD_PATH = os.environ.get("VLLM_EXPERT_PAGER_SSD_PATH")
 # is nothing to hide the expansion under either.
 COMPRESS = os.environ.get("VLLM_EXPERT_PAGER_COMPRESS", "auto")
 # Fixed length of a compressed row as a ratio of the raw row. If an expert does
-# not fit, loading stops and reports the ratio needed. The largest ratio seen so
-# far (over 24,576 experts) is 0.877.
-PITCH_RATIO = float(os.environ.get("VLLM_EXPERT_PAGER_PITCH", "0.88"))
+# not fit, loading stops and reports the ratio needed. How much a row compresses
+# is a property of the model: Qwen3.8-Flash-Next-FP8 fits at 0.877 over all
+# 24,576 of its experts, while Qwen3.6-35B-A3B-FP8 does not fit at 0.88 -- the
+# first row to overflow asks for 0.8880, and loading stops there, so all that is
+# known is that 0.89 holds every row. The default covers both; a model that
+# compresses better can be given a smaller ratio.
+PITCH_RATIO = float(os.environ.get("VLLM_EXPERT_PAGER_PITCH", "0.89"))
 # Number of rows W of the working slab used by prefill (the working-buffer
 # path). The needed experts are split into chunks of this many and the MoE runs
 # once per chunk. The decode staging for compressed rows (S rows x pitch) also
